@@ -1,0 +1,804 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: >-
+  cloudsweep: CPU compute on AWS Batch that scales to zero, its storage, the agent identity,
+  and the budget guard. Deployed by `cloudsweep deploy`, which first stores guard.py in the bucket.
+
+Parameters:
+  Prefix:
+    Type: String
+    Default: cloudsweep
+    AllowedPattern: "[a-z][a-z0-9-]{0,19}"
+    Description: Names every resource and the Project cost-allocation tag.
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+    Description: The account's default VPC (no routing changes are made).
+  Subnets:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Public subnets of that VPC; workers get transient public addresses, no inbound access.
+  InstanceTypes:
+    Type: CommaDelimitedList
+    Default: m7a.large,m7a.xlarge,m7a.2xlarge,m7a.4xlarge
+    Description: EC2 instance types Batch may start; all must share one CPU architecture.
+  MaxvCpus:
+    Type: Number
+    Default: 32
+    MinValue: 1
+    Description: Batch may exceed this by one instance under BEST_FIT_PROGRESSIVE.
+  RootVolumeGiB:
+    Type: Number
+    Default: 60
+    MinValue: 30
+    Description: Encrypted gp3 root disk per worker; holds image layers, checkout, build and outputs.
+  GuardCodeKey:
+    Type: String
+    AllowedPattern: "lambda/guard-[0-9a-f]{64}[.]zip"
+    Description: Bucket key of the zipped guard.py that setup uploads before deploying.
+  QueueState:
+    Type: String
+    Default: ENABLED
+    AllowedValues: [ENABLED, DISABLED]
+    Description: Setup passes DISABLED while the budget cutoff is latched.
+  Identity:
+    Type: String
+    Default: assume-role
+    AllowedValues: [assume-role, roles-anywhere]
+    Description: >-
+      How the agent profile gets credentials: assume-role (from the administrator's own
+      credentials on the same machine) or roles-anywhere (an X.509 certificate, no AWS keys).
+  CaCertificate:
+    Type: String
+    Default: none
+    Description: PEM certificate of the local CA that issues the agent certificate (roles-anywhere only).
+  AlertAmount1:
+    Type: Number
+    Default: 50
+    MinValue: 1
+    Description: First actual-spend email alert, USD per month.
+  AlertAmount2:
+    Type: Number
+    Default: 80
+    MinValue: 1
+    Description: Second actual-spend email alert, USD per month.
+  CutoffAmount:
+    Type: Number
+    Default: 100
+    MinValue: 1
+    Description: Reported actual spend, USD per month, that latches the cutoff.
+  AlertEmail:
+    Type: String
+    AllowedPattern: "[^@\\s]+@[^@\\s]+\\.[^@\\s]+"
+  LogRetentionDays:
+    Type: Number
+    Default: 90
+    AllowedValues: [30, 90, 180, 365]
+
+Conditions:
+  UseRolesAnywhere: !Equals [!Ref Identity, roles-anywhere]
+
+Resources:
+  # Storage: retained when the stack is deleted, so evidence outlives the compute.
+  Bucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub ${Prefix}-${AWS::AccountId}-${AWS::Region}
+      VersioningConfiguration: {Status: Enabled}
+      OwnershipControls: {Rules: [{ObjectOwnership: BucketOwnerEnforced}]}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      LifecycleConfiguration:
+        Rules:
+          - Id: abort-incomplete-uploads
+            Status: Enabled
+            AbortIncompleteMultipartUpload: {DaysAfterInitiation: 7}
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref Bucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: TlsOnly
+            Effect: Deny
+            Principal: "*"
+            Action: s3:*
+            Resource: [!GetAtt Bucket.Arn, !Sub "${Bucket.Arn}/*"]
+            Condition: {Bool: {aws:SecureTransport: "false"}}
+
+  Repository:
+    Type: AWS::ECR::Repository
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      RepositoryName: !Sub ${Prefix}-worker
+      ImageTagMutability: IMMUTABLE
+      ImageScanningConfiguration: {ScanOnPush: true}
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  # Logs are deleted with the stack; the worker uploads its own logs to the bucket.
+  JobLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/batch/${Prefix}
+      RetentionInDays: !Ref LogRetentionDays
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  GuardLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Prefix}-guard
+      RetentionInDays: !Ref LogRetentionDays
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  ControlLogs:
+    Type: AWS::Logs::LogGroup
+    DeletionPolicy: Delete
+    UpdateReplacePolicy: Delete
+    Properties:
+      LogGroupName: !Sub /aws/lambda/${Prefix}-control
+      RetentionInDays: !Ref LogRetentionDays
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  # Compute: one managed EC2 environment that scales to zero, one queue.
+  WorkerSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Batch workers; no inbound access
+      VpcId: !Ref VpcId
+      SecurityGroupEgress: [{IpProtocol: "-1", CidrIp: 0.0.0.0/0}]
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  WorkerLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Properties:
+      LaunchTemplateName: !Sub ${Prefix}-worker
+      LaunchTemplateData:
+        BlockDeviceMappings:
+          - DeviceName: /dev/xvda
+            Ebs: {VolumeSize: !Ref RootVolumeGiB, VolumeType: gp3, Encrypted: true, DeleteOnTermination: true}
+        MetadataOptions: {HttpEndpoint: enabled, HttpTokens: required, HttpPutResponseHopLimit: 1, HttpProtocolIpv6: disabled}
+        TagSpecifications:
+          - ResourceType: instance
+            Tags: [{Key: Project, Value: !Ref Prefix}]
+          - ResourceType: volume
+            Tags: [{Key: Project, Value: !Ref Prefix}]
+          - ResourceType: network-interface
+            Tags: [{Key: Project, Value: !Ref Prefix}]
+        # Host-network jobs run as UID 1000. Reinstall the metadata block before every ECS
+        # start, including after reboot; a missing/broken iptables must prevent registration.
+        # This UID check is defense in depth, not isolation from a process that becomes root.
+        UserData:
+          Fn::Base64: |
+            Content-Type: multipart/mixed; boundary="==BOUNDARY=="
+            MIME-Version: 1.0
+
+            --==BOUNDARY==
+            Content-Type: text/x-shellscript; charset="us-ascii"
+
+            #!/bin/bash
+            set -eu
+            mkdir -p /etc/systemd/system/ecs.service.d
+            cat > /etc/systemd/system/ecs.service.d/10-block-imds.conf <<'EOF'
+            [Service]
+            ExecStartPre=/usr/sbin/iptables -w -I OUTPUT 1 -d 169.254.169.254/32 -m owner ! --uid-owner 0 -j DROP
+            EOF
+            systemctl daemon-reload
+            # ECS waits for cloud-final; a blocking restart here would deadlock user data.
+            systemctl --no-block restart ecs.service
+
+            --==BOUNDARY==--
+      TagSpecifications:
+        - ResourceType: launch-template
+          Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  InstanceRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-batch-instance
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: ec2.amazonaws.com}, Action: sts:AssumeRole}
+      # Batch creates the cluster. No CreateCluster, legacy deregistration, or Spot
+      # draining permission is needed for these on-demand instances. setup checks
+      # Batch's returned cluster ARN against this pattern before enabling cloud use.
+      Policies:
+        - PolicyName: project-ecs-instance
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: CallsWithoutResourceScoping
+                Effect: Allow
+                Action: [ec2:DescribeTags, ecs:DiscoverPollEndpoint, ecr:GetAuthorizationToken]
+                Resource: "*"
+                Condition: {StringEquals: {aws:RequestedRegion: !Ref AWS::Region}}
+              - Sid: RegisterAndReportToTheProjectCluster
+                Effect: Allow
+                Action: [ecs:RegisterContainerInstance, ecs:SubmitAttachmentStateChanges,
+                         ecs:SubmitContainerStateChange, ecs:SubmitTaskStateChange]
+                Resource: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/AWSBatch-${Prefix}-cpu-*
+              - Sid: PollAndReportProjectInstanceHealth
+                Effect: Allow
+                Action: [ecs:Poll, ecs:StartTelemetrySession]
+                Resource: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:container-instance/AWSBatch-${Prefix}-cpu-*/*
+              - Sid: TagOnlyWhileRegisteringProjectInstances
+                Effect: Allow
+                Action: ecs:TagResource
+                Resource: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:container-instance/AWSBatch-${Prefix}-cpu-*/*
+                Condition: {StringEquals: {ecs:CreateAction: RegisterContainerInstance}}
+              - Sid: ReadProjectInstanceAndTaskTags
+                Effect: Allow
+                Action: ecs:ListTagsForResource
+                Resource:
+                  - !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:container-instance/AWSBatch-${Prefix}-cpu-*/*
+                  - !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:task/AWSBatch-${Prefix}-cpu-*/*
+              - Sid: PullOnlyTheProjectImage
+                Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource: !GetAtt Repository.Arn
+              - Sid: WriteOnlyProjectJobLogs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub arn:${AWS::Partition}:logs:${AWS::Region}:${AWS::AccountId}:log-group:/aws/batch/${Prefix}:log-stream:*
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      InstanceProfileName: !Sub ${Prefix}-batch-instance
+      Roles: [!Ref InstanceRole]
+
+  ComputeEnvironment:
+    Type: AWS::Batch::ComputeEnvironment
+    Properties:
+      ComputeEnvironmentName: !Sub ${Prefix}-cpu
+      Type: MANAGED
+      State: !Ref QueueState
+      ReplaceComputeEnvironment: false
+      ComputeResources:
+        Type: EC2
+        AllocationStrategy: BEST_FIT_PROGRESSIVE
+        MinvCpus: 0
+        MaxvCpus: !Ref MaxvCpus
+        InstanceTypes: !Ref InstanceTypes
+        Subnets: !Ref Subnets
+        SecurityGroupIds: [!Ref WorkerSecurityGroup]
+        InstanceRole: !GetAtt InstanceProfile.Arn
+        LaunchTemplate:
+          LaunchTemplateId: !Ref WorkerLaunchTemplate
+          Version: !GetAtt WorkerLaunchTemplate.LatestVersionNumber
+        Ec2Configuration: [{ImageType: ECS_AL2023}]
+        UpdateToLatestImageVersion: true
+        Tags: {Project: !Ref Prefix, Name: !Sub "${Prefix}-batch-worker"}
+      Tags: {Project: !Ref Prefix}
+
+  JobQueue:
+    Type: AWS::Batch::JobQueue
+    Properties:
+      JobQueueName: !Sub ${Prefix}-cpu
+      Priority: 1
+      State: !Ref QueueState
+      ComputeEnvironmentOrder: [{Order: 1, ComputeEnvironment: !Ref ComputeEnvironment}]
+      # Waiting queues alert through the guard; scarcity must not cancel work.
+      Tags: {Project: !Ref Prefix}
+
+  # Jobs: unprivileged; images come through the execution role. This definition names no image:
+  # it is the template submit copies into a revision pinned to each revision image's digest.
+  ExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-batch-execution
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition: {StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}}
+      Policies:
+        - PolicyName: pull-and-log
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: ecr:GetAuthorizationToken, Resource: "*"}
+              - Effect: Allow
+                Action: [ecr:BatchGetImage, ecr:GetDownloadUrlForLayer, ecr:BatchCheckLayerAvailability]
+                Resource: !GetAtt Repository.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${JobLogs.Arn}"
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  JobRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-batch-job
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: Allow
+            Principal: {Service: ecs-tasks.amazonaws.com}
+            Action: sts:AssumeRole
+            Condition: {StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}}
+      Policies:
+        - PolicyName: project-objects
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - {Effect: Allow, Action: s3:ListBucket, Resource: !GetAtt Bucket.Arn}
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: [!Sub "${Bucket.Arn}/inputs/*", !Sub "${Bucket.Arn}/submissions/*"]
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub "${Bucket.Arn}/runs/*"
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  RunJobDefinition:
+    Type: AWS::Batch::JobDefinition
+    Properties:
+      JobDefinitionName: !Sub ${Prefix}-run
+      Type: container
+      PlatformCapabilities: [EC2]
+      Parameters: {submission: unset}
+      ResourceRetentionPolicy: {SkipDeregisterOnUpdate: true}
+      RetryStrategy:
+        Attempts: 2
+        EvaluateOnExit:
+          - {OnStatusReason: "Host EC2*", Action: RETRY}
+          - {OnReason: "*", Action: EXIT}
+      Timeout: {AttemptDurationSeconds: 86400}
+      ContainerProperties:
+        Image: !Sub "${Repository.RepositoryUri}:unpublished"
+        Command: [run, Ref::submission]
+        User: "1000"
+        Privileged: false
+        JobRoleArn: !GetAtt JobRole.Arn
+        ExecutionRoleArn: !GetAtt ExecutionRole.Arn
+        ResourceRequirements: [{Type: VCPU, Value: "1"}, {Type: MEMORY, Value: "3500"}]
+        LinuxParameters: {InitProcessEnabled: true}
+        Environment:
+          - {Name: CLOUDSWEEP_STORE, Value: !Sub "s3://${Bucket}"}
+          - {Name: IMAGE_DIGEST, Value: unpublished}
+          - {Name: AWS_DEFAULT_REGION, Value: !Ref AWS::Region}
+        LogConfiguration:
+          LogDriver: awslogs
+          Options: {awslogs-group: !Ref JobLogs, awslogs-region: !Ref AWS::Region, awslogs-stream-prefix: run}
+      Tags: {Project: !Ref Prefix}
+
+  # The agent identity: a role the administrator's credentials assume, or IAM Roles Anywhere
+  # with a certificate issued by a local CA.
+  TrustAnchor:
+    Type: AWS::RolesAnywhere::TrustAnchor
+    Condition: UseRolesAnywhere
+    Properties:
+      Name: !Sub ${Prefix}-agent
+      Enabled: true
+      Source:
+        SourceType: CERTIFICATE_BUNDLE
+        SourceData: {X509CertificateData: !Ref CaCertificate}
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  AgentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-agent
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - !If
+            - UseRolesAnywhere
+            - Effect: Allow
+              Principal: {Service: rolesanywhere.amazonaws.com}
+              Action: [sts:AssumeRole, sts:TagSession, sts:SetSourceIdentity]
+              Condition:
+                ArnEquals: {aws:SourceArn: !GetAtt TrustAnchor.TrustAnchorArn}
+                StringEquals:
+                  aws:SourceAccount: !Ref AWS::AccountId
+                  aws:PrincipalTag/x509Subject/CN: !Sub ${Prefix}-agent
+            # Principals of this account whose own IAM policy allows sts:AssumeRole on it
+            # (the administrator's profile is the agent profile's source profile).
+            - Effect: Allow
+              Principal: {AWS: !Sub "arn:${AWS::Partition}:iam::${AWS::AccountId}:root"}
+              Action: sts:AssumeRole
+      # Inline only: the guard attaches its deny out of band, and nothing here lists managed
+      # policies for an update to reconcile away.
+      Policies:
+        - PolicyName: agent
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Sid: SubmitOnlyToTheProjectQueueAndAnyRevisionOfItsDefinition
+                Effect: Allow
+                Action: batch:SubmitJob
+                Resource:
+                  - !Sub arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job-queue/${Prefix}-cpu
+                  - !Sub arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job-definition/${Prefix}-run
+                  - !Sub arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job-definition/${Prefix}-run:*
+                  - !Sub arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job/*
+              - Sid: ReadBatchStateTheseActionsCannotScope
+                Effect: Allow
+                Action: [batch:DescribeJobs, batch:ListJobs, batch:DescribeJobQueues,
+                         batch:DescribeComputeEnvironments, batch:DescribeJobDefinitions]
+                Resource: "*"
+              - Sid: CancelThroughTheQueueCheckingHandler
+                Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: !Sub arn:${AWS::Partition}:lambda:${AWS::Region}:${AWS::AccountId}:function:${Prefix}-control
+              - Sid: ProjectBucket
+                Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+              - Sid: ReadProjectObjects
+                Effect: Allow
+                Action: s3:GetObject
+                Resource: !Sub "${Bucket.Arn}/*"
+              - Sid: WriteSubmissionObjects
+                Effect: Allow
+                Action: s3:PutObject
+                Resource: [!Sub "${Bucket.Arn}/inputs/*", !Sub "${Bucket.Arn}/submissions/*"]
+              - Sid: ReadJobLogs
+                Effect: Allow
+                Action: [logs:GetLogEvents, logs:FilterLogEvents, logs:DescribeLogStreams]
+                Resource: !Sub "${JobLogs.Arn}"
+              - Sid: ReadCutoffState
+                Effect: Allow
+                Action: ssm:GetParameter
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Prefix}/cloud/cutoff
+              - Sid: ReadImageSizes
+                Effect: Allow
+                Action: ecr:DescribeImages
+                Resource: !GetAtt Repository.Arn
+              # Images: push the accepted base and each revision image (pulling the base on another
+              # host). Registration goes through the Lambda, which copies the stack's exact
+              # template and changes only the digest. IAM alone cannot constrain host mounts.
+              - Sid: LogInToTheRegistryThisActionCannotScope
+                Effect: Allow
+                Action: ecr:GetAuthorizationToken
+                Resource: "*"
+              - Sid: PushAndPullTheProjectRepository
+                Effect: Allow
+                Action: [ecr:BatchCheckLayerAvailability, ecr:InitiateLayerUpload, ecr:UploadLayerPart,
+                         ecr:CompleteLayerUpload, ecr:PutImage, ecr:BatchGetImage, ecr:GetDownloadUrlForLayer]
+                Resource: !GetAtt Repository.Arn
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  AgentProfile:
+    Type: AWS::RolesAnywhere::Profile
+    Condition: UseRolesAnywhere
+    Properties:
+      Name: !Sub ${Prefix}-agent
+      Enabled: true
+      DurationSeconds: 3600
+      RoleArns: [!GetAtt AgentRole.Arn]
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  # Precreated: the guard attaches it to the agent role on cutoff.
+  SubmitDeny:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub ${Prefix}-submit-deny
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement: [{Effect: Deny, Action: batch:SubmitJob, Resource: "*"}]
+
+  # The guard: budget alerts, the cutoff topic, the scheduled reconciliation, health email.
+  CutoffTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Prefix}-budget-cutoff
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  CutoffTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref CutoffTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OnlyThisBudget
+            Effect: Allow
+            Principal: {Service: budgets.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref CutoffTopic
+            Condition:
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+              ArnEquals: {aws:SourceArn: !Sub "arn:${AWS::Partition}:budgets::${AWS::AccountId}:budget/${Prefix}-monthly"}
+
+  HealthTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub ${Prefix}-health
+      Subscription: [{Protocol: email, Endpoint: !Ref AlertEmail}]
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  HealthTopicPolicy:
+    Type: AWS::SNS::TopicPolicy
+    Properties:
+      Topics: [!Ref HealthTopic]
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: OnlyGuardAlarms
+            Effect: Allow
+            Principal: {Service: cloudwatch.amazonaws.com}
+            Action: sns:Publish
+            Resource: !Ref HealthTopic
+            Condition:
+              StringEquals: {aws:SourceAccount: !Ref AWS::AccountId}
+              ArnLike: {aws:SourceArn: !Sub "arn:${AWS::Partition}:cloudwatch:${AWS::Region}:${AWS::AccountId}:alarm:${Prefix}-guard-*"}
+
+  GuardRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-guard
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: guard
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: iam:ListAttachedRolePolicies
+                Resource: !GetAtt AgentRole.Arn
+              - Effect: Allow
+                Action: iam:AttachRolePolicy
+                Resource: !GetAtt AgentRole.Arn
+                Condition: {ArnEquals: {iam:PolicyARN: !Ref SubmitDeny}}
+              - Effect: Allow
+                Action: [ssm:GetParameter, ssm:PutParameter]
+                Resource: !Sub arn:${AWS::Partition}:ssm:${AWS::Region}:${AWS::AccountId}:parameter/${Prefix}/cloud/cutoff
+              - Effect: Allow
+                Action: budgets:ViewBudget
+                Resource: !Sub arn:${AWS::Partition}:budgets::${AWS::AccountId}:budget/${Prefix}-monthly
+              - Effect: Allow
+                Action: batch:UpdateJobQueue
+                Resource: !Ref JobQueue
+              - Effect: Allow
+                Action: batch:UpdateComputeEnvironment
+                Resource: !Ref ComputeEnvironment
+              - Effect: Allow
+                Action: [batch:ListJobs, batch:DescribeComputeEnvironments]
+                Resource: "*"
+              - Sid: StopJobsTheCodeListsFromTheProjectQueue
+                Effect: Allow
+                Action: batch:TerminateJob
+                Resource: !Sub arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job/*
+              - Effect: Allow
+                Action: ecs:ListContainerInstances
+                Resource: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/AWSBatch-${Prefix}-cpu-*
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub "${Bucket.Arn}/guard/*"
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt Bucket.Arn
+              - Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref HealthTopic
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${GuardLogs.Arn}"
+              - Sid: KeepTheProjectCostTagActiveSoTheBudgetCountsIt
+                Effect: Allow
+                Action: [ce:ListCostAllocationTags, ce:UpdateCostAllocationTagsStatus]
+                Resource: "*"
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  GuardFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [GuardLogs]
+    Properties:
+      FunctionName: !Sub ${Prefix}-guard
+      Runtime: python3.12
+      Handler: index.handler
+      Role: !GetAtt GuardRole.Arn
+      Timeout: 120
+      MemorySize: 128
+      ReservedConcurrentExecutions: 1
+      Code: {S3Bucket: !Ref Bucket, S3Key: !Ref GuardCodeKey}
+      Environment:
+        Variables:
+          PROJECT: !Ref Prefix
+          REGION: !Ref AWS::Region
+          ACCOUNT: !Ref AWS::AccountId
+          BUDGET_NAME: !Sub ${Prefix}-monthly
+          CUTOFF_AMOUNT: !Ref CutoffAmount
+          STATE_PARAMETER: !Sub /${Prefix}/cloud/cutoff
+          DENY_POLICY_ARN: !Ref SubmitDeny
+          AGENT_ROLE: !Ref AgentRole
+          TOPIC_ARN: !Ref CutoffTopic
+          RULE_ARN: !Sub arn:${AWS::Partition}:events:${AWS::Region}:${AWS::AccountId}:rule/${Prefix}-guard-reconcile
+          QUEUE_ARN: !Ref JobQueue
+          CE_ARN: !Ref ComputeEnvironment
+          BUCKET: !Ref Bucket
+          HEALTH_TOPIC_ARN: !Ref HealthTopic
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  BudgetInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GuardFunction
+      Principal: sns.amazonaws.com
+      SourceArn: !Ref CutoffTopic
+      SourceAccount: !Ref AWS::AccountId
+
+  BudgetSubscription:
+    Type: AWS::SNS::Subscription
+    DependsOn: BudgetInvokePermission
+    Properties:
+      Protocol: lambda
+      Endpoint: !GetAtt GuardFunction.Arn
+      TopicArn: !Ref CutoffTopic
+
+  ReconcileRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub ${Prefix}-guard-reconcile
+      ScheduleExpression: rate(5 minutes)
+      State: ENABLED
+      Targets:
+        - Id: guard
+          Arn: !GetAtt GuardFunction.Arn
+          RetryPolicy: {MaximumRetryAttempts: 3, MaximumEventAgeInSeconds: 900}
+
+  ReconcileInvokePermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref GuardFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReconcileRule.Arn
+      SourceAccount: !Ref AWS::AccountId
+
+  GuardErrors:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: HealthTopicPolicy
+    Properties:
+      AlarmName: !Sub ${Prefix}-guard-errors
+      AlarmDescription: The budget guard failed or found capacity that did not return to zero; read its log.
+      Namespace: AWS/Lambda
+      MetricName: Errors
+      Dimensions: [{Name: FunctionName, Value: !Ref GuardFunction}]
+      Statistic: Sum
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 1
+      ComparisonOperator: GreaterThanOrEqualToThreshold
+      TreatMissingData: notBreaching
+      AlarmActions: [!Ref HealthTopic]
+
+  GuardSilent:
+    Type: AWS::CloudWatch::Alarm
+    DependsOn: HealthTopicPolicy
+    Properties:
+      AlarmName: !Sub ${Prefix}-guard-silent
+      AlarmDescription: The budget guard has not run for 30 minutes (rule disabled or throttled).
+      Namespace: AWS/Lambda
+      MetricName: Invocations
+      Dimensions: [{Name: FunctionName, Value: !Ref GuardFunction}]
+      Statistic: Sum
+      Period: 900
+      EvaluationPeriods: 2
+      Threshold: 1
+      ComparisonOperator: LessThanThreshold
+      TreatMissingData: breaching
+      AlarmActions: [!Ref HealthTopic]
+
+  # Gross tagged cost: credits and refunds excluded, so they cannot hide project usage.
+  ProjectBudget:
+    Type: AWS::Budgets::Budget
+    DependsOn: [CutoffTopicPolicy, BudgetSubscription]
+    Properties:
+      Budget:
+        BudgetName: !Sub ${Prefix}-monthly
+        BudgetType: COST
+        TimeUnit: MONTHLY
+        BudgetLimit: {Amount: !Ref CutoffAmount, Unit: USD}
+        CostFilters: {TagKeyValue: [!Sub "user:Project$${Prefix}"]}
+        CostTypes: {UseBlended: false, IncludeCredit: false, IncludeRefund: false}
+      NotificationsWithSubscribers:
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: !Ref AlertAmount1, ThresholdType: ABSOLUTE_VALUE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: !Ref AlertAmount2, ThresholdType: ABSOLUTE_VALUE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+        - Notification: {NotificationType: FORECASTED, ComparisonOperator: GREATER_THAN, Threshold: !Ref CutoffAmount, ThresholdType: ABSOLUTE_VALUE}
+          Subscribers: [{SubscriptionType: EMAIL, Address: !Ref AlertEmail}]
+        - Notification: {NotificationType: ACTUAL, ComparisonOperator: GREATER_THAN, Threshold: !Ref CutoffAmount, ThresholdType: ABSOLUTE_VALUE}
+          Subscribers:
+            - {SubscriptionType: EMAIL, Address: !Ref AlertEmail}
+            - {SubscriptionType: SNS, Address: !Ref CutoffTopic}
+      ResourceTags: [{Key: Project, Value: !Ref Prefix}]
+
+  # Agents cancel project-queue jobs and request fixed-template image registration here.
+  ControlRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub ${Prefix}-control
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - {Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: sts:AssumeRole}
+      Policies:
+        - PolicyName: control
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: Allow
+                Action: [batch:ListJobs, batch:DescribeComputeEnvironments, batch:DescribeJobDefinitions]
+                Resource: "*"
+              - Sid: RegisterTheProjectRunDefinition
+                Effect: Allow
+                Action: batch:RegisterJobDefinition
+                Resource: !Sub arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job-definition/${Prefix}-run
+                Condition:
+                  StringLike: {batch:Image: !Sub "${Repository.RepositoryUri}@sha256:*"}
+                  StringEquals: {batch:User: "1000"}
+                  Bool: {batch:Privileged: "false"}
+              - Sid: PassOnlyTheProjectJobRoles
+                Effect: Allow
+                Action: iam:PassRole
+                Resource: [!GetAtt JobRole.Arn, !GetAtt ExecutionRole.Arn]
+                Condition: {StringEquals: {iam:PassedToService: ecs-tasks.amazonaws.com}}
+              - Effect: Allow
+                Action: batch:TerminateJob
+                Resource: !Sub arn:${AWS::Partition}:batch:${AWS::Region}:${AWS::AccountId}:job/*
+              - Effect: Allow
+                Action: ecs:ListContainerInstances
+                Resource: !Sub arn:${AWS::Partition}:ecs:${AWS::Region}:${AWS::AccountId}:cluster/AWSBatch-${Prefix}-cpu-*
+              - Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub "${ControlLogs.Arn}"
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+  ControlFunction:
+    Type: AWS::Lambda::Function
+    DependsOn: [ControlLogs]
+    Properties:
+      FunctionName: !Sub ${Prefix}-control
+      Runtime: python3.12
+      Handler: index.control_handler
+      Role: !GetAtt ControlRole.Arn
+      Timeout: 120
+      MemorySize: 128
+      Code: {S3Bucket: !Ref Bucket, S3Key: !Ref GuardCodeKey}
+      Environment:
+        Variables:
+          REGION: !Ref AWS::Region
+          QUEUE_ARN: !Ref JobQueue
+          CE_ARN: !Ref ComputeEnvironment
+          RUN_TEMPLATE_ARN: !Ref RunJobDefinition
+          REPOSITORY_URI: !GetAtt Repository.RepositoryUri
+      Tags: [{Key: Project, Value: !Ref Prefix}]
+
+Outputs:
+  Bucket: {Value: !Ref Bucket}
+  Queue: {Value: !Ref JobQueue}
+  ComputeEnvironment: {Value: !Ref ComputeEnvironment}
+  Repository: {Value: !GetAtt Repository.RepositoryUri}
+  JobLogGroup: {Value: !Ref JobLogs}
+  AgentRoleArn: {Value: !GetAtt AgentRole.Arn}
+  TrustAnchorArn: {Condition: UseRolesAnywhere, Value: !GetAtt TrustAnchor.TrustAnchorArn}
+  ProfileArn: {Condition: UseRolesAnywhere, Value: !GetAtt AgentProfile.ProfileArn}
+  ControlFunction: {Value: !Ref ControlFunction}
+  StateParameter: {Value: !Sub "/${Prefix}/cloud/cutoff"}
+  SubmitDenyArn: {Value: !Ref SubmitDeny}
+  RunJobDefinitionName: {Value: !Sub "${Prefix}-run"}

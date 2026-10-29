@@ -1,0 +1,4 @@
+#!/bin/sh
+# Run cloudsweep from a clone without installing it: put this directory on PATH.
+here=$(cd "$(dirname "$0")/.." && pwd)
+PYTHONPATH="$here/src${PYTHONPATH:+:$PYTHONPATH}" exec python3 -m cloudsweep "$@"

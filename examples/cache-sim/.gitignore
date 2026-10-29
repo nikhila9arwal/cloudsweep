@@ -1,0 +1,7 @@
+# Local cloudsweep state and fetched results
+.cloudsweep/
+cloudsweep-results/
+# Build output, generated sweeps, and traces (large data, passed with --input)
+build/
+sweep.jsonl
+traces/*.txt
