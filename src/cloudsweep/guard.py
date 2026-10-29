@@ -108,21 +108,46 @@ def validate_budget(budget, config):
     return result
 
 
-def queue_jobs(batch, queue):
-    """Every nonterminal job in the project queue, array children included (deduplicated)."""
+def queue_jobs(batch, queue, children=True):
+    """Every nonterminal job in the project queue (deduplicated), with array children unless
+    children is False."""
     found = {}
     pages = batch.get_paginator("list_jobs")
     for status in WAITING + ACTIVE:
         for page in pages.paginate(jobQueue=queue, jobStatus=status):
             for job in page.get("jobSummaryList", []):
                 found.setdefault(job["jobId"], dict(job, parent=None))
-    for parent in [job for job in found.values() if "size" in job.get("arrayProperties", {})]:
+    if children:
+        for child in children_of(batch, [job for job in found.values() if "size" in job.get("arrayProperties", {})]):
+            found.setdefault(child["jobId"], child)
+    return list(found.values())
+
+
+def children_of(batch, parents):
+    found = []
+    pages = batch.get_paginator("list_jobs")
+    for parent in parents:
         for status in WAITING + ACTIVE:
             for page in pages.paginate(arrayJobId=parent["jobId"], jobStatus=status):
-                for child in page.get("jobSummaryList", []):
-                    found.setdefault(child["jobId"], dict(child, parent=parent["jobId"],
-                                                          jobName=parent["jobName"]))
-    return list(found.values())
+                found += [dict(child, parent=parent["jobId"], jobName=parent["jobName"])
+                          for child in page.get("jobSummaryList", [])]
+    return found
+
+
+def stop_all(batch, top, reason, remaining_ms=None):
+    """Stop top-level jobs first: a stopped array parent stops its children, so children are
+    listed only for parents whose stop failed. A queue of large arrays therefore cannot use
+    up the deadline in enumeration before any stop request is sent."""
+    done, errors = stop_jobs(batch, top, reason, remaining_ms)
+    stopped = set(done["cancelled"] + done["terminated"])
+    failed = [job for job in top if "size" in job.get("arrayProperties", {}) and job["jobId"] not in stopped
+              and job["status"] in WAITING + ACTIVE]
+    if failed and not any("deadline" in error for error in errors):
+        more, more_errors = stop_jobs(batch, children_of(batch, failed), reason, remaining_ms)
+        for bucket in done:
+            done[bucket] += more[bucket]
+        errors += more_errors
+    return done, errors
 
 
 def leaves(jobs):
@@ -311,9 +336,9 @@ def run(event, config, clients, now=None, remaining_ms=None):
                 computeEnvironment=config["CE_ARN"], state="DISABLED")
 
     watch = attempt(errors, "watch state", read_json, s3, config["BUCKET"], "guard/watch.json") or {}
-    jobs = attempt(errors, "list jobs", queue_jobs, batch, config["QUEUE_ARN"])
+    jobs = attempt(errors, "list jobs", queue_jobs, batch, config["QUEUE_ARN"], not active)
     if jobs is not None and active:
-        result["stopped"], stop_errors = stop_jobs(batch, jobs, "project budget cutoff", remaining_ms)
+        result["stopped"], stop_errors = stop_all(batch, jobs, "project budget cutoff", remaining_ms)
         errors += stop_errors
     elif jobs is not None:
         stuck, stalled, watch = watchdog(jobs, watch, now)
@@ -378,9 +403,9 @@ def cancel_run(event, config, clients, remaining_ms=None):
     elif mode not in ("all", "status") or value is not True:
         return {"error": 'expected {"all": true} or {"status": true}'}
     batch, ecs = clients["batch"], clients["ecs"]
-    jobs = [] if mode == "status" else [job for job in queue_jobs(batch, config["QUEUE_ARN"])
+    jobs = [] if mode == "status" else [job for job in queue_jobs(batch, config["QUEUE_ARN"], children=False)
                                        if mode == "all" or job["jobName"] == value + "-run"]
-    done, errors = stop_jobs(batch, jobs, "cancelled by cloudsweep", remaining_ms)
+    done, errors = stop_all(batch, jobs, "cancelled by cloudsweep", remaining_ms)
     try:
         if remaining_ms is not None and remaining_ms() < 20000:
             raise RuntimeError("capacity unread before Lambda deadline; poll status")

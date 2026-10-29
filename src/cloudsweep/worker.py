@@ -16,6 +16,7 @@ import platform
 import resource
 import shutil
 import signal
+import ssl
 import subprocess
 import sys
 import time
@@ -97,7 +98,11 @@ def run_quiet(argv, **kwargs):
 
 
 def tracked_changes(src):
-    return run_quiet(["git", "-C", str(src), "status", "--porcelain", "--untracked-files=no"])
+    """A hash of the tracked files' state relative to the commit: which changed, and their
+    content and modes (empty diff for a clean checkout)."""
+    status = subprocess.check_output(["git", "-C", str(src), "status", "--porcelain", "--untracked-files=no"])
+    diff = subprocess.check_output(["git", "-C", str(src), "diff", "--binary", "HEAD"])
+    return core.sha256_bytes(status + b"\0" + diff)
 
 
 def run_child(argv, **kwargs):
@@ -307,6 +312,11 @@ def check_mode():
         versions["git"] = run_quiet(["git", "--version"])
     except (OSError, subprocess.CalledProcessError):
         problems.append("git is missing")
+    # The worker reaches S3 over HTTPS, which needs Python's ssl module and CA certificates.
+    paths = ssl.get_default_verify_paths()
+    if not ((paths.cafile and os.path.isfile(paths.cafile))
+            or (paths.capath and os.path.isdir(paths.capath) and os.listdir(paths.capath))):
+        problems.append("no CA certificates for HTTPS (install the ca-certificates package)")
     print(json.dumps({"ok": not problems, "problems": problems, "versions": versions}, indent=2, sort_keys=True))
     return 0 if not problems else 1
 
@@ -322,8 +332,10 @@ def main(argv=None):
     if len(args) != 2 or args[0] != "run" or not core.SUBMISSION_RE.fullmatch(args[1]):
         print(__doc__, file=sys.stderr)
         return 2
-    for signum in (signal.SIGTERM, signal.SIGINT):
+    for signum in (signal.SIGTERM, signal.SIGINT, signal.SIGALRM):
         signal.signal(signum, STOP.handle)
+    if os.environ.get("CLOUDSWEEP_TIME_LIMIT"):  # local runs; on AWS, Batch enforces the limit
+        signal.alarm(int(os.environ["CLOUDSWEEP_TIME_LIMIT"]))
     return run_mode(open_store(os.environ.get("CLOUDSWEEP_STORE", ""), os.environ), args[1], os.environ, work)
 
 

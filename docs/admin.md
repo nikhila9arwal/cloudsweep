@@ -11,7 +11,9 @@ lift a budget cutoff or remove the deployment. All of this runs through `cloudsw
 cloudsweep deploy --admin-profile admin --email you@example.org
 ```
 
-The first deploy takes about five minutes. It:
+The first deploy takes about five minutes. Before creating anything, it checks that the account's
+Lambda concurrency quota leaves room for the guard (new accounts sometimes have a quota of 10; the
+message says how to request more). It:
 
 1. finds the region's default VPC and its subnets (or uses `--vpc` and `--subnets`) and checks that
    the subnets give instances public addresses and a route to the internet: instances need it to
@@ -24,11 +26,12 @@ The first deploy takes about five minutes. It:
 6. checks that the agent profile works.
 
 Rerun `deploy` with only the options you want to change; every other setting keeps its current
-value:
+value. A rerun updates the deployment recorded in `.cloudsweep/deploy.env` (its name and region)
+unless you pass `--prefix` or `--region`:
 
 | Option | Default |
 |---|---|
-| `--region` | the admin profile's region, else `us-east-1` |
+| `--region` | the recorded deployment's region, else the admin profile's, else `us-east-1` |
 | `--instance-types` | `m7a.large,m7a.xlarge,m7a.2xlarge,m7a.4xlarge` |
 | `--max-vcpus` | 32 |
 | `--alerts A1,A2` and `--cutoff C` | 50,80 and 100 (USD per month) |
@@ -80,7 +83,8 @@ no spend. The vCPU cap and the per-run ceiling still limit spending in that peri
 When reported monthly spend reaches the cutoff, the guard immediately:
 
 - records the cutoff in an SSM parameter;
-- attaches a policy to the agent role that denies all job submission;
+- attaches a policy to the agent role that denies job submission, uploads to the bucket and image
+  pushes (reading results and cancelling still work);
 - disables the queue and the compute environment;
 - stops every waiting and running job.
 

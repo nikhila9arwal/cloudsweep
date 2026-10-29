@@ -79,6 +79,11 @@ class SizingTests(unittest.TestCase):
         self.assertEqual((estimate["instance"], estimate["run_each_usd"], estimate["total_estimate_usd"]),
                          ("m7a.large", "0.23", "2.32"))
 
+    def test_the_worst_case_is_the_most_expensive_instance_that_fits(self):
+        # Batch may place a 1-vCPU job alone on a 4xlarge when smaller sizes are short of capacity.
+        self.assertEqual(core.worst_cost(TYPES, 1, 3500, Decimal(2)), Decimal("1.85472"))
+        self.assertEqual(core.estimate(TYPES, 10, 1, 3500, Decimal(2))["total_worst_usd"], "18.55")
+
     def test_instance_types_are_validated(self):
         for bad in ({}, {"m7a.large": {"vcpus": 2, "memory_mib": 8192, "usd_per_hour": "0"}},
                     {"bad": {"vcpus": 2, "memory_mib": 8192, "usd_per_hour": "1"}}):

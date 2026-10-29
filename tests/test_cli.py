@@ -14,7 +14,7 @@ from unittest import mock
 
 from helpers import PACKAGE, TYPES, git, make_repo
 
-from cloudsweep import admin, cli, project, settings
+from cloudsweep import admin, cli, project, settings, submit
 
 try:
     import yaml
@@ -137,7 +137,7 @@ class SubmitTests(unittest.TestCase):
         plan = json.loads(out)
         self.assertEqual((plan["commit"], plan["instance"], plan["hours"]), (self.commit, "m7a.large", "0.5"))
         self.assertEqual(plan["base_digest"], "sha256:" + "a" * 64)  # 10:00-04:00 is 14:00 UTC, the newer
-        self.assertEqual(plan["estimate"]["run_each_usd"], "0.06")
+        self.assertEqual((plan["estimate"]["run_each_usd"], plan["estimate"]["run_worst_usd"]), ("0.06", "0.46"))
 
     def test_refusals_explain_what_to_do(self):
         cases = [
@@ -164,6 +164,10 @@ class SubmitTests(unittest.TestCase):
         deployment(self.repo / ".cloudsweep/deploy.env", **{settings.ENABLED: "0"})
         with self.assertRaisesRegex(project.Refusal, "cloud use is off"):
             REAL_ADMIT(self.repo, read=lambda aws, values: None)
+
+    def test_deployment_architecture_selects_the_image_platform(self):
+        self.assertEqual(submit.platform_of(settings.load(self.repo)), "linux/amd64")
+        self.assertIsNone(submit.platform_of(None))
 
     def test_settings_round_trip_and_worktrees_share_them(self):
         values = settings.load(self.repo)
@@ -244,6 +248,13 @@ class DeployArgumentTests(unittest.TestCase):
     def test_a_latched_cutoff_keeps_the_queue_disabled(self):
         parameters = admin.parameters_from(self.args(), {}, "k", {"cutoff_active": True})
         self.assertEqual(parameters["QueueState"], "DISABLED")
+
+    def test_low_lambda_concurrency_is_refused_before_anything_is_created(self):
+        def aws(*args, **kwargs):
+            return {"AccountLimit": {"ConcurrentExecutions": 10, "UnreservedConcurrentExecutions": 10}}
+        aws.region = "us-east-1"
+        with self.assertRaisesRegex(project.Refusal, "Service Quotas"):
+            admin.check_lambda_concurrency(aws)
 
     def test_prices_come_from_the_price_list(self):
         product = {"product": {"attributes": {"licenseModel": "No License required"}},

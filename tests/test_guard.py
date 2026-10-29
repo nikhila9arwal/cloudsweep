@@ -227,7 +227,9 @@ class GuardTests(unittest.TestCase):
         self.assertEqual((world.queue_state, world.ce_state), ("DISABLED", "DISABLED"))
         self.assertEqual(world.stops(), {("terminate", "waiting"), ("terminate", "starting"),
                                          ("terminate", "running"), ("terminate", "array")})
-        self.assertEqual(sorted(result["stopped"]["terminated"]), ["array:0", "running", "starting"])
+        # A stopped array parent stops its children; they are not listed one by one.
+        self.assertEqual(sorted(result["stopped"]["terminated"]), ["running", "starting"])
+        self.assertIn("array", result["stopped"]["cancelled"])
         self.assertEqual(next(j for j in world.jobs if j["jobId"] == "array:2")["status"], "SUCCEEDED")
         notices = [message for name, message in world.events if name == "notify"]
         self.assertEqual(len(notices), 1)
@@ -456,7 +458,7 @@ class CancelHandlerTests(unittest.TestCase):
         result = guard.cancel_run({"submission": SUB}, CONFIG, world.clients)
         self.assertNotIn(("terminate", "other"), world.stops())
         self.assertIn(("terminate", "array"), world.stops())
-        self.assertIn("array:0", result["stopped"]["terminated"])
+        self.assertIn("array", result["stopped"]["cancelled"])
         self.assertEqual(result["errors"], [])
         self.assertEqual(result["capacity"]["desired_vcpus"], 0)
         everything = guard.cancel_run({"all": True}, CONFIG, world.clients)

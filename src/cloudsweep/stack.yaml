@@ -487,14 +487,20 @@ Resources:
       RoleArns: [!GetAtt AgentRole.Arn]
       Tags: [{Key: Project, Value: !Ref Prefix}]
 
-  # Precreated: the guard attaches it to the agent role on cutoff.
+  # Precreated: the guard attaches it to the agent role on cutoff. It stops new compute and new
+  # uploads; reading results and cancelling (the control function) stay possible.
   SubmitDeny:
     Type: AWS::IAM::ManagedPolicy
     Properties:
       ManagedPolicyName: !Sub ${Prefix}-submit-deny
       PolicyDocument:
         Version: "2012-10-17"
-        Statement: [{Effect: Deny, Action: batch:SubmitJob, Resource: "*"}]
+        Statement:
+          - {Effect: Deny, Action: batch:SubmitJob, Resource: "*"}
+          - {Effect: Deny, Action: s3:PutObject, Resource: !Sub "${Bucket.Arn}/*"}
+          - Effect: Deny
+            Action: [ecr:InitiateLayerUpload, ecr:UploadLayerPart, ecr:CompleteLayerUpload, ecr:PutImage]
+            Resource: !GetAtt Repository.Arn
 
   # The guard: budget alerts, the cutoff topic, the scheduled reconciliation, health email.
   CutoffTopic:

@@ -19,7 +19,7 @@ import zipfile
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
-from . import core, project, settings
+from . import core, engine, project, settings
 from .guard import initial_state, valid_state, validate_budget
 from .project import Refusal
 
@@ -45,7 +45,6 @@ BOOTSTRAP = {
                                  "Tags": [{"Key": "Project", "Value": {"Ref": "Prefix"}}]}}},
     "Outputs": {"Bucket": {"Value": {"Ref": "Bucket"}}},
 }
-PLATFORMS = {"x86_64": "linux/amd64", "arm64": "linux/arm64"}
 
 
 def die(message):
@@ -270,6 +269,17 @@ def parameters_from(args, previous, guard_key, latch):
     return parameters
 
 
+def check_lambda_concurrency(aws):
+    """The guard reserves one concurrent Lambda execution, and AWS keeps 100 unreserved: an
+    account whose quota leaves fewer than 101 unreserved cannot create the guard."""
+    limit = aws("lambda", "get-account-settings")["AccountLimit"]
+    if limit.get("UnreservedConcurrentExecutions", 0) < 101:
+        die("this account's Lambda concurrency (%s total, %s unreserved) is too low for the guard, which "
+            "reserves 1 while AWS keeps 100 unreserved. New accounts often have a quota of 10: request "
+            "'Concurrent executions' of at least 1000 in Service Quotas (Lambda) for %s, then rerun deploy"
+            % (limit.get("ConcurrentExecutions"), limit.get("UnreservedConcurrentExecutions"), aws.region))
+
+
 def default_network(aws):
     """The default VPC and its default subnets (public, with an internet-gateway route)."""
     vpcs = aws("ec2", "describe-vpcs", "--filters", "Name=isDefault,Values=true")["Vpcs"]
@@ -324,7 +334,7 @@ def instance_specs(aws, names, prices):
         price = prices.get(name) or on_demand_price(aws, name)
         types[name] = {"vcpus": item["VCpuInfo"]["DefaultVCpus"], "memory_mib": item["MemoryInfo"]["SizeInMiB"],
                        "usd_per_hour": str(price)}
-    if len(architectures) != 1 or not architectures <= set(PLATFORMS):
+    if len(architectures) != 1 or not architectures <= set(engine.PLATFORMS):
         die("instance types must share one architecture, x86_64 or arm64 (found %s)" % ", ".join(sorted(architectures)))
     return core.check_instance_types(types), architectures.pop()
 
@@ -398,13 +408,17 @@ def deploy(args):
     validate(args)
     repo = project.repository()
     config = project.load(repo) if (repo / project.NAME).is_file() else None
-    args.prefix = args.prefix or (project.name(config) if config else None)
+    path = settings.settings_path(repo)
+    recorded = settings.read_values(path) if path.is_file() else {}
+    # A rerun updates the recorded deployment unless told otherwise.
+    args.prefix = args.prefix or recorded.get("PREFIX") or (project.name(config) if config else None)
     if not args.prefix or not project.PREFIX_RE.fullmatch(args.prefix):
         die("name the deployment: [project] name in cloudsweep.ini, or --prefix (1-20 lower-case letters, "
             "digits or hyphens, starting with a letter)")
     prefix = args.prefix
     profile = admin_profile(args)
-    region = args.region or configured_region(profile) or "us-east-1"
+    region = (args.region or (recorded.get("REGION") if recorded.get("PREFIX") == prefix else None)
+              or configured_region(profile) or "us-east-1")
     stack = prefix + "-cloud"
     aws = admin_aws(args, region)
     say("administrator %s in %s (profile %s)" % (aws("sts", "get-caller-identity")["Arn"], region, profile))
@@ -417,6 +431,8 @@ def deploy(args):
     previous = current["parameters"] if current and "GuardCodeKey" in current["parameters"] else {}
     if not previous and queue_state(latch) == "DISABLED":
         die("a cutoff latch from an earlier deployment is set; inspect /%s/cloud/cutoff first" % prefix)
+    if not previous:
+        check_lambda_concurrency(aws)
     if not (args.vpc or previous.get("VpcId")):
         args.vpc, found = default_network(aws)
         args.subnets = args.subnets or found

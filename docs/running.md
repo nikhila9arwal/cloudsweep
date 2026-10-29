@@ -11,7 +11,7 @@ cloudsweep try --commands sweep.jsonl --input traces/a.txt --keep /tmp/trial
 ```
 
 `try` builds the revision image for the commit and runs each command through the worker on your
-machine, one after another, with no network inside the container. It then checks the results the
+machine, one after another, with no network inside the container and with the same time limit. It then checks the results the
 same way `fetch` does. It uses the local base image from `cloudsweep image build`, or else pulls the
 newest published one. Use `try` to find a wrong path or a missing library before you pay for it.
 
@@ -45,7 +45,7 @@ A short script that writes the file is usually the clearest way to define a swee
   active;
 - no deployed instance type can hold the requested vCPUs and memory, or the instance it needs is
   larger than the vCPU cap;
-- the worst-case cost of one command is above `CLOUDSWEEP_MAX_RUN_USD`.
+- the worst-case cost of one command is above `CLOUDSWEEP_MAX_RUN_USD` (see below).
 
 When it succeeds, it prints the submission ID (for example `20261029T205712Z-1fad4b`), the instance
 type, and a cost estimate. It also writes a receipt to `.cloudsweep/receipts/`. If the connection
@@ -60,10 +60,13 @@ run-to-run timing matters, reserve all of an instance's vCPUs (`--vcpus 2` on a 
 `--isolated`. About 90% of an instance's memory is assumed usable by jobs, so a 3,500 MiB command
 fits on an 8 GiB instance and a 7,500 MiB one needs the next size up.
 
-The per-run estimate is the price of the whole cheapest instance that fits the command, multiplied
-by its time limit. It is an upper bound for one attempt. Commands that share an instance, or finish
-early, cost less. A retry after a host failure, instance start-up time, and idle time before an
-instance stops add to the cost.
+`submit` prints two figures per command. The *estimate* is the price of the whole cheapest instance
+that fits the command, multiplied by its time limit. The *worst case* is the price of the most
+expensive deployed instance type that fits, times the same limit: Batch places a job on a larger
+instance when the best-fitting size is short of capacity. The ceiling is checked against the worst
+case. Commands that share an instance, or finish early, cost less than the estimate. A retry after
+a host failure, instance start-up time, and idle time before an instance stops add to both. If the
+worst case blocks long runs, deploy without the largest types or raise the ceiling.
 
 ## status shows jobs, capacity and reported spend
 
@@ -115,5 +118,8 @@ cloudsweep cancel --all --wait 30        # and wait until no instance is left
 ```
 
 Waiting commands are cancelled, and running ones are stopped. A command receives SIGTERM and has
-20 seconds to exit before it is killed. Whatever it has written to `{out}` is still uploaded.
+20 seconds to exit before it is killed. The worker then uploads what the command wrote to `{out}`,
+but Batch kills the container 30 seconds after SIGTERM, so this upload is best effort: large
+outputs may not finish. A command that must keep partial results should write them as it goes and
+expect only some of them back.
 Cancelling works when cloud use is off and when the cutoff is active.

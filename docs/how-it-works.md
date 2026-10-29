@@ -33,11 +33,11 @@ task-role endpoint that Batch provides. This is why your image needs only `pytho
 |---|---|
 | The source is a commit, not a working tree with edits | `submit`, `try` |
 | The image the job runs is the one submitted (digest) | worker, before running |
-| The checkout is that commit, and its tracked files are as built | worker, before running |
+| The checkout is that commit, and its tracked files (content and modes) are as built | worker, before running |
 | The binary has the SHA-256 recorded when it was built | worker, before running |
 | Every input has the SHA-256 recorded at submission | worker, after download |
 | Every output file has the size and SHA-256 that the worker recorded | `fetch` |
-| A success names the submitted commit, image and binary | `fetch` |
+| A success names the submitted commit and image digest (the digest fixes the binary) | `fetch` |
 | A new base image reproduces a known result (if configured) | `image build`, `image publish` |
 
 The hashes show that the files you hold are the files that were produced, by that commit in that
@@ -65,8 +65,13 @@ Day-to-day commands use the agent role. It can:
 - read Batch state, this deployment's job logs, and the cutoff parameter;
 - invoke the control Lambda.
 
+Batch's read actions (DescribeJobs, ListJobs, DescribeJobDefinitions, ...) cannot be limited to one
+queue, so the agent can also *read* other Batch jobs and job definitions in the same account and
+region, including their environment variables. Do not deploy into an account whose other Batch
+workloads keep secrets in environment variables, or use a separate account.
+
 It cannot register job definitions, pass IAM roles, change the budget, the cap or the cutoff,
-terminate jobs directly, or touch anything outside the deployment. A job definition is registered
+terminate jobs directly, or change anything outside the deployment. A job definition is registered
 only by the control Lambda. The Lambda copies the stack's own template and changes nothing except
 the image digest, which must be in this deployment's repository. A job therefore always runs as UID
 1000, unprivileged, without host mounts, with the stack's roles.
@@ -81,13 +86,16 @@ could reach that service.
 
 - **The vCPU cap** is a Batch setting. With the default allocation strategy, Batch may go over the
   cap by one instance.
-- **The per-run ceiling** is checked by `submit` on your machine, against the price that `deploy`
-  read.
+- **The per-run ceiling** is checked by `submit` on your machine, against the worst case: the most
+  expensive deployed instance type that fits the command, at the price that `deploy` read.
 - **The cutoff** acts on AWS Budgets' *reported* spend, which is hours behind real usage. Spending
   between the last report and the cutoff is not prevented. The budget counts only costs tagged
   `Project=<name>`, and only once that tag is active (see
   [Administration](admin.md#the-budget-counts-only-an-active-cost-allocation-tag)). It counts gross
   costs: credits and refunds are not subtracted.
+- **When the cutoff trips**, the agent role is denied job submission, uploads to the bucket and
+  image pushes. It can still read results and cancel. Storage already kept goes on costing until
+  you delete it.
 - **The guard** emails you if it fails or stops running. It runs as a Lambda with one reserved
   concurrent execution.
 

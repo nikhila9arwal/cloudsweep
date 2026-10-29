@@ -72,7 +72,7 @@ class WorkerTests(unittest.TestCase):
         record = json.loads((fixture.work / "build.json").read_text())
         self.assertEqual(record["commit"], fixture.commit)
         self.assertEqual(record["binary"]["sha256"], core.sha256_file(fixture.work / "src/build/sim"))
-        self.assertEqual(record["tracked_changes"], "")
+        self.assertEqual(record["tracked_changes"], core.sha256_bytes(b"\0"))  # clean: empty status and diff
 
     def test_a_sweep_runs_each_child_and_fetch_verifies_everything(self):
         commands = [["{bin}", "{out}", "{input:data/in.txt}", "0"], ["{bin}", "{out}", "README", "0"]]
@@ -110,6 +110,13 @@ class WorkerTests(unittest.TestCase):
         errors = [a.get("error") or "" for a in fixture.fetch()["children"][0]["attempts"]]
         self.assertIn("not the submission's image", errors[0])
         self.assertIn("binary differs", errors[1])
+
+    def test_a_changed_tracked_file_never_runs(self):
+        fixture = Fixture(self.scratch, [["{bin}", "{out}", "README", "0"]],
+                          recipe=dict(RECIPE, command=RECIPE["command"] + " && echo built >> README"))
+        (fixture.work / "src/README").write_text("x\nbuilt\nedited\n")  # same status line, new content
+        self.assertNotEqual(fixture.run(), 0)
+        self.assertIn("differs from its build record", fixture.fetch()["children"][0]["attempts"][0]["error"])
 
     def test_inputs_cannot_replace_files_of_the_revision(self):
         fixture = Fixture(self.scratch, [["{bin}", "{out}", "{input:README}", "0"]], {"README": "evil"})

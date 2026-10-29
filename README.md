@@ -8,8 +8,8 @@ spending goes past a limit you set.
 
 It works for any program that runs from the command line on Linux, reads files and writes files:
 cycle-level and functional simulators, network simulators, solvers, Monte Carlo codes, scripts.
-Your toolchain goes in your own Dockerfile. cloudsweep needs only `python3` (3.8+) and `git`
-inside that image.
+Your toolchain goes in your own Dockerfile. cloudsweep needs only `python3` (3.8+), `git` and CA
+certificates inside that image.
 
 ```
 your Git repo ──commit──▶ revision image ──▶ AWS Batch queue ──▶ one container per command
@@ -24,18 +24,20 @@ your Git repo ──commit──▶ revision image ──▶ AWS Batch queue ─
 - A Linux or macOS machine with Python 3.9+, Git, the
   [AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html),
   and Docker or Podman.
+- An account whose Lambda concurrency quota is at least 1,000. This is the default, but new accounts
+  sometimes start at 10. `deploy` checks the quota and says how to raise it.
 - An AWS account, and an AWS CLI profile with administrator rights in it. You need these rights
   only for `cloudsweep deploy` and the other `admin` commands. Day-to-day commands use a narrower
   agent profile that deploy creates.
 - Your simulator in a Git repository.
 
-Install:
+Install from a clone:
 
 ```bash
-pip install git+https://github.com/<you>/cloudsweep
+git clone <this repository's URL> cloudsweep && pip install ./cloudsweep
 ```
 
-You can also run it from a clone without installing it: put `cloudsweep/bin` on your `PATH`.
+Or run it without installing it: put `cloudsweep/bin` on your `PATH`.
 
 ## Quick start
 
@@ -79,7 +81,7 @@ Three limits bound spending. You set each one:
 | Limit | Default | What it does |
 |---|---|---|
 | vCPU cap | 32 vCPUs | Batch never runs more than this, plus at most one extra instance |
-| Per-run ceiling | $10 | `submit` refuses a command whose worst-case cost is above this. Worst case: the whole cheapest instance that fits the command, for its full time limit |
+| Per-run ceiling | $10 | `submit` refuses a command whose worst-case cost is above this. Worst case: the command alone on the most expensive deployed instance type that fits it, for its full time limit |
 | Monthly cutoff | $100 (emails at $50 and $80) | When AWS Budgets reports spend at the cutoff, the guard stops all jobs and blocks new ones until an administrator lifts it |
 
 AWS billing data arrive hours after usage, so the final bill can exceed the cutoff. The cutoff

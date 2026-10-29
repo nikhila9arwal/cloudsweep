@@ -9,7 +9,8 @@ or any IAM setting. Every command refuses with a message that says what to do in
 - Work only on committed source. Commit before you submit; never try to send a working tree.
 - Run a command locally with `cloudsweep try` before you submit it to AWS, especially after
   changing the command line or the build.
-- Use `cloudsweep submit --dry-run` to see the instance and the estimate before a large sweep.
+- Use `cloudsweep submit --dry-run` to see the instance, the estimate and the worst case before a
+  large sweep.
 - Report what ran and what it cost: the submission ID, the commit, and the estimate that `submit`
   printed. Report the month-to-date spend from `cloudsweep status` when it matters.
 - A submission's results are the files under `fetch`'s directory, and they count as results only
@@ -32,7 +33,7 @@ than local compute and `.cloudsweep/deploy.env` has `CLOUDSWEEP_ENABLED=1`.
 
 1. Commit, then `cloudsweep try` the command (or a few lines of the sweep) locally.
 2. `cloudsweep submit --dry-run ...`, then `cloudsweep submit ...`.
-3. `cloudsweep fetch <submission> --wait <dest>`; use the results only if it reports `complete`.
+3. `cloudsweep fetch <submission> <dest> --wait`; use the results only if it reports `complete`.
 4. Record the submission ID, commit and printed estimate with the results.
 
 Do not run `cloudsweep deploy` or `cloudsweep admin`, and do not edit `.cloudsweep/deploy.env`:

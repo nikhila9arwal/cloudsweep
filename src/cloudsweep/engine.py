@@ -25,6 +25,7 @@ from .project import Refusal
 HERE = Path(__file__).resolve().parent
 WORKER_FILES = ("worker.py", "core.py", "s3lite.py")
 BASE_TAG, REVISION_TAG = "base-", "rev-"
+PLATFORMS = {"x86_64": "linux/amd64", "arm64": "linux/arm64"}  # deployment architecture -> image platform
 WORKER_LAYER = """\
 FROM {toolchain}
 USER 0

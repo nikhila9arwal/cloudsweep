@@ -39,8 +39,9 @@ check = cmp {out}/result.json tests/reference.json
 ## The Dockerfile holds your toolchain and nothing of cloudsweep's
 
 Write the Dockerfile you would use to build and run your simulator: compilers, libraries, Python
-packages, anything else. It must also install `python3` (3.8 or newer) and `git`, which the worker
-uses. `cloudsweep image build` builds your Dockerfile, then adds a small layer on top: the worker in
+packages, anything else. It must also install `python3` (3.8 or newer), `git` and CA certificates
+(`ca-certificates` on Debian and Ubuntu), which the worker uses to reach S3 over HTTPS. `image
+build` checks all three. `cloudsweep image build` builds your Dockerfile, then adds a small layer on top: the worker in
 `/opt/cloudsweep`, a writable `/work`, and an unprivileged user with UID 1000. Any base
 distribution works.
 

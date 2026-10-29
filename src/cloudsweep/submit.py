@@ -135,10 +135,12 @@ def main(args):
                           "less, or an administrator raises it (`cloudsweep deploy --max-vcpus`)"
                           % (instance, types[instance]["vcpus"], cap))
         ceiling = settings.max_run_usd(values)
-        if core.job_cost(types, vcpus, memory_mib, hours) > ceiling:
-            raise Refusal("one run's estimate is $%s (a whole %s for %s h), above the ceiling of $%s per run "
-                          "(%s in %s); request a shorter time limit or less memory, or raise the ceiling"
-                          % (cost["run_each_usd"], instance, hours, ceiling, settings.MAX_RUN, values["_path"]))
+        if core.worst_cost(types, vcpus, memory_mib, hours) > ceiling:
+            raise Refusal("one run's worst case is $%s (alone on the most expensive instance type that fits it, "
+                          "for the whole %s h limit), above the ceiling of $%s per run (%s in %s); request a "
+                          "shorter time limit or fewer resources, raise the ceiling, or deploy without the "
+                          "larger instance types" % (cost["run_worst_usd"], hours, ceiling, settings.MAX_RUN,
+                                                     values["_path"]))
         repository = values["REPOSITORY"]
         base = engine.newest_base(aws, repository)
         tag = engine.revision_tag(commit, base, recipe)
@@ -194,8 +196,9 @@ def main(args):
         return settings.fail(error)
     print("submitted %s: %d command(s) at %s on %s; job %s" % (
         submission, len(commands), commit[:12], instance, receipt["job"]))
-    print("estimate: $%s ($%s per run: a whole %s at $%s/h for the time limit); excludes %s" % (
-        cost["total_estimate_usd"], cost["run_each_usd"], instance, cost["instance_usd_per_hour"], cost["excludes"]))
+    print("estimate: $%s ($%s per run: a whole %s at $%s/h for the time limit); worst case $%s; excludes %s" % (
+        cost["total_estimate_usd"], cost["run_each_usd"], instance, cost["instance_usd_per_hour"],
+        cost["total_worst_usd"], cost["excludes"]))
     print("receipt: %s" % path)
     print("next: cloudsweep status %s    |    cloudsweep fetch %s --wait" % (submission, submission))
     return 0
@@ -236,6 +239,7 @@ def trial(repo, commit, recipe, base, base_digest, files, commands, root, hours=
         engine.run_local(image, ["run", submission], mounts=[(root / "store", "/store")],
                          environment=[("CLOUDSWEEP_STORE", "file:///store"), ("IMAGE_DIGEST", image),
                                       ("AWS_BATCH_JOB_ATTEMPT", "1"), ("AWS_BATCH_JOB_ARRAY_INDEX", str(child)),
+                                      ("CLOUDSWEEP_TIME_LIMIT", str(core.timeout_seconds(hours))),
                                       ("AWS_BATCH_JOB_ID", "local")], stdout=sys.stderr)
     return fetch.fetch(store, submission, root / "results")
 

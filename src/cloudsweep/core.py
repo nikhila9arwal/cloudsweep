@@ -272,18 +272,28 @@ def largest(types):
 
 
 def job_cost(types, vcpus, memory_mib, hours):
-    """One run's estimated cost: the whole cheapest instance that fits it, for its time limit.
+    """One run's expected cost: the whole cheapest instance that fits it, for its time limit.
     Runs sharing an instance cost less; a retry after a host failure, startup and idle time add."""
     return Decimal(str(instance_for(types, vcpus, memory_mib)[1]["usd_per_hour"])) * Decimal(str(hours))
 
 
+def worst_cost(types, vcpus, memory_mib, hours):
+    """One run's worst case: alone on the most expensive listed instance that fits it, for its
+    whole time limit. Batch may place a job on a larger instance than the best fit when the
+    best fit is short of capacity, so this, not job_cost, bounds one attempt."""
+    instance_for(types, vcpus, memory_mib)  # refuses requests no size fits
+    return max(Decimal(str(spec["usd_per_hour"])) for spec in types.values()
+               if vcpus <= spec["vcpus"] and memory_mib <= schedulable_mib(spec)) * Decimal(str(hours))
+
+
 def estimate(types, jobs, vcpus, memory_mib, hours):
-    """Execution cost at the requested limits: job_cost for each command."""
+    """Execution cost at the requested limits, expected and worst case, per run and in total."""
     name, spec = instance_for(types, vcpus, memory_mib)
-    each = job_cost(types, vcpus, memory_mib, hours)
+    each, worst = job_cost(types, vcpus, memory_mib, hours), worst_cost(types, vcpus, memory_mib, hours)
     cents = Decimal("0.01")
     return {"instance": name, "instance_usd_per_hour": str(spec["usd_per_hour"]),
             "run_each_usd": str(each.quantize(cents)), "total_estimate_usd": str((each * jobs).quantize(cents)),
+            "run_worst_usd": str(worst.quantize(cents)), "total_worst_usd": str((worst * jobs).quantize(cents)),
             "excludes": "startup and idle tails, storage, logs, data transfer"}
 
 
