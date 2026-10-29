@@ -143,7 +143,11 @@ def stop_all(batch, top, reason, remaining_ms=None):
     failed = [job for job in top if "size" in job.get("arrayProperties", {}) and job["jobId"] not in stopped
               and job["status"] in WAITING + ACTIVE]
     if failed and not any("deadline" in error for error in errors):
-        more, more_errors = stop_jobs(batch, children_of(batch, failed), reason, remaining_ms)
+        try:
+            children = children_of(batch, failed)
+        except Exception as error:  # recorded; the next invocation retries
+            return done, errors + ["list children: " + failure(error)]
+        more, more_errors = stop_jobs(batch, children, reason, remaining_ms)
         for bucket in done:
             done[bucket] += more[bucket]
         errors += more_errors

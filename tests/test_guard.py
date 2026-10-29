@@ -319,6 +319,29 @@ class GuardTests(unittest.TestCase):
         self.assertTrue(json.loads(world.objects["guard/spend.json"])["cutoff_active"])
         self.assertTrue(any(name == "notify" for name, _ in world.events))
 
+    def test_failed_child_listing_after_a_failed_parent_stop_still_notifies(self):
+        world = World("50")
+        sweep(world)
+        world.failures[("terminate", "array")] = 1
+        original = world.get_paginator
+
+        def paginator(name):
+            found = original(name)
+            if name != "list_jobs":
+                return found
+
+            def pages(**kwargs):
+                if kwargs.get("arrayJobId"):
+                    raise AwsError("ThrottlingException")
+                return found.pages(**kwargs)
+            return Paginator(pages)
+        world.get_paginator = paginator
+        with self.assertRaises(RuntimeError):
+            world.run()
+        self.assertTrue(world.state["cutoff_active"])
+        self.assertEqual(sum(name == "notify" for name, _ in world.events), 1)
+        self.assertIn("guard/spend.json", world.objects)
+
     def test_duplicates_and_month_rollover_never_reset_the_latch(self):
         world = World("50")
         world.run(SNS)

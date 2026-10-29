@@ -39,11 +39,16 @@ class Stop:
         self.signal = None
         self.at = None
         self.child = None
+        self.interruptible = False
 
     def handle(self, signum, frame):
         if self.signal is None:
             self.signal, self.at = signum, time.monotonic()
         self.forward(signal.SIGTERM)
+        # Between commands (fetching inputs, checking the build) stop at once; the uploads that
+        # follow are never interrupted, so the attempt still records what happened.
+        if self.child is None and self.interruptible:
+            raise Terminated("terminated by signal %d" % signum)
 
     def forward(self, signum):
         if self.child is not None:
@@ -101,7 +106,8 @@ def tracked_changes(src):
     """A hash of the tracked files' state relative to the commit: which changed, and their
     content and modes (empty diff for a clean checkout)."""
     status = subprocess.check_output(["git", "-C", str(src), "status", "--porcelain", "--untracked-files=no"])
-    diff = subprocess.check_output(["git", "-C", str(src), "diff", "--binary", "HEAD"])
+    diff = subprocess.check_output(["git", "-C", str(src), "diff", "--binary", "--no-textconv", "--no-ext-diff",
+                                    "HEAD"])
     return core.sha256_bytes(status + b"\0" + diff)
 
 
@@ -236,6 +242,7 @@ def run_mode(store, submission, env, work):
     phases, clock = {}, time.monotonic()
     stdout, stderr = paths.logs / "stdout.txt", paths.logs / "stderr.txt"
     build, manifest = None, None
+    STOP.interruptible = True
     try:
         manifest, commands = load_submission(store, submission)
         core.require(0 <= child < len(commands), "array index %d is outside the command manifest" % child)
@@ -260,6 +267,8 @@ def run_mode(store, submission, env, work):
         result.update(status="terminated", error=str(error))
     except Exception as error:  # recorded in the manifest; the job fails
         result["error"] = "%s: %s" % (type(error).__name__, error)
+    finally:
+        STOP.interruptible = False
     upload_tree(store, prefix, files, paths.out, "out/")
     upload_tree(store, prefix, files, paths.logs)
     phases["upload_s"] = round(time.monotonic() - clock, 3)
@@ -303,6 +312,21 @@ def build_mode(work):
     return 0
 
 
+def ca_certificates():
+    """Whether Python's default trust store holds at least one CA certificate."""
+    paths = ssl.get_default_verify_paths()
+    if paths.cafile and os.path.isfile(paths.cafile):
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+        try:
+            context.load_verify_locations(cafile=paths.cafile)
+        except (ssl.SSLError, OSError):
+            return False
+        return context.cert_store_stats()["x509_ca"] > 0
+    # A hashed directory (c_rehash) is read lazily; count the certificate files in it.
+    return bool(paths.capath and os.path.isdir(paths.capath)
+                and any(name.endswith((".pem", ".crt", ".0")) for name in os.listdir(paths.capath)))
+
+
 def check_mode():
     """Whether this image can host the worker: Python version and Git."""
     problems, versions = [], {"python": platform.python_version()}
@@ -313,9 +337,7 @@ def check_mode():
     except (OSError, subprocess.CalledProcessError):
         problems.append("git is missing")
     # The worker reaches S3 over HTTPS, which needs Python's ssl module and CA certificates.
-    paths = ssl.get_default_verify_paths()
-    if not ((paths.cafile and os.path.isfile(paths.cafile))
-            or (paths.capath and os.path.isdir(paths.capath) and os.listdir(paths.capath))):
+    if not ca_certificates():
         problems.append("no CA certificates for HTTPS (install the ca-certificates package)")
     print(json.dumps({"ok": not problems, "problems": problems, "versions": versions}, indent=2, sort_keys=True))
     return 0 if not problems else 1

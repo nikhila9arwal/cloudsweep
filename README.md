@@ -34,7 +34,7 @@ your Git repo ──commit──▶ revision image ──▶ AWS Batch queue ─
 Install from a clone:
 
 ```bash
-git clone <this repository's URL> cloudsweep && pip install ./cloudsweep
+pip install /path/to/cloudsweep      # your clone of this repository
 ```
 
 Or run it without installing it: put `cloudsweep/bin` on your `PATH`.

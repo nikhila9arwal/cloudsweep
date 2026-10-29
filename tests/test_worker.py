@@ -6,6 +6,7 @@ import shutil
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from helpers import PACKAGE, core, git, make_repo
@@ -141,6 +142,15 @@ class WorkerTests(unittest.TestCase):
 class CheckTests(unittest.TestCase):
     def test_check_reports_python_and_git(self):
         self.assertEqual(worker.check_mode(), 0)
+
+    def test_an_unusable_ca_file_fails_the_check(self):
+        with tempfile.TemporaryDirectory() as scratch:
+            bad = Path(scratch) / "ca.pem"
+            bad.write_text("not a certificate\n")
+            paths = worker.ssl.DefaultVerifyPaths(str(bad), None, None, None, None, None)
+            with mock.patch.object(worker.ssl, "get_default_verify_paths", return_value=paths):
+                self.assertFalse(worker.ca_certificates())
+        self.assertTrue(worker.ca_certificates())  # this machine's real trust store
 
 
 if __name__ == "__main__":

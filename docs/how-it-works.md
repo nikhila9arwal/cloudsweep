@@ -66,8 +66,8 @@ Day-to-day commands use the agent role. It can:
 - invoke the control Lambda.
 
 Batch's read actions (DescribeJobs, ListJobs, DescribeJobDefinitions, ...) cannot be limited to one
-queue, so the agent can also *read* other Batch jobs and job definitions in the same account and
-region, including their environment variables. Do not deploy into an account whose other Batch
+queue, so the agent can also *read* other Batch jobs and job definitions in the same account, in
+any region, including their environment variables. Do not deploy into an account whose other Batch
 workloads keep secrets in environment variables, or use a separate account.
 
 It cannot register job definitions, pass IAM roles, change the budget, the cap or the cutoff,
