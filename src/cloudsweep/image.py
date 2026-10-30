@@ -11,6 +11,7 @@ still produces the known result before anything runs on it.
 
 import argparse
 import json
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -57,8 +58,11 @@ def accept(repo, name, image, image_id, revision, keep=None):
     out = root / "results" / summary["submission"] / "0" / "1" / "out"
     check = spec["check"].replace("{out}", _quote(str(out)))
     passed = summary["complete"] and subprocess.run(["/bin/sh", "-c", check], cwd=str(repo)).returncode == 0
+    if passed and not keep:
+        shutil.rmtree(str(root), ignore_errors=True)
     result = {"image_id": image_id, "commit": commit, "submission": summary["submission"], "passed": passed,
-              "check": spec["check"], "evidence": str(root), "at": core.now_iso()}
+              "check": spec["check"], "evidence": str(root) if keep or not passed else None,
+              "at": core.now_iso()}
     path = acceptance_path(repo, image_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_bytes(core.pretty(result))

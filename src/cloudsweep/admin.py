@@ -596,9 +596,28 @@ def retire(args):
     values = settings.load(repo)
     prefix, region = values["PREFIX"], values["REGION"]
     aws = admin_aws(args, region)
-    current = previous_stack(aws, prefix)
+    current = describe_stack(aws, prefix + "-cloud")
+    if current is None and args.delete_data:
+        # A rerun after --delete-data stopped partway: the stack is gone, the data may not be.
+        print("retire: stack %s-cloud is already deleted" % prefix, flush=True)
+    else:
+        delete_stack(aws, dict(values), prefix, previous_stack(aws, prefix))
+    # The stack removes only its own current revision; agents registered the others.
+    for definition in settings.active_definitions(aws, values["RUN_JOB_DEFINITION"]):
+        aws("batch", "deregister-job-definition", "--job-definition", definition["jobDefinitionArn"])
+    if args.delete_data:
+        delete_data(aws, values, prefix)
+        return 0
+    print("retire: deleted %s-cloud and its job definitions. Kept, and still billed for storage: bucket %s and "
+          "image repository %s. Also left: the latch parameter %s, the %s-agent profile in your AWS config and "
+          "%s. To delete all of them, rerun with --delete-data."
+          % (prefix, values["BUCKET"], values["REPOSITORY"], values["STATE_PARAMETER"], prefix, values["_path"]))
+    return 0
+
+
+def delete_stack(aws, values, prefix, current):
+    """Close admission, stop every job, wait for the instances to go, then delete the stack."""
     outputs = current["outputs"]
-    values = dict(values)
     values[settings.ENABLED] = "0"
     settings.write(values["_path"], values)
     # Close admission before listing jobs to stop; keep the guard alive during drainage.
@@ -626,7 +645,9 @@ def retire(args):
             break
         if time.time() >= deadline:
             die("capacity still present after 30 minutes; stack retained: %s; tagged EC2 %s" % (capacity, remaining))
-        print("retire: waiting for capacity to drain: %s; %s" % (capacity, remaining), flush=True)
+        print("retire: waiting for instances to stop (Batch scales down a few minutes after work ends): "
+              "%d desired vCPUs, %d registered instance(s), EC2 %s"
+              % (capacity["desired_vcpus"], capacity["instances"], ", ".join(remaining) or "none"), flush=True)
         time.sleep(30)
         result = control({"status": True})
     # Prevent an in-flight reconciler from reattaching the policy during deletion.
@@ -637,14 +658,77 @@ def retire(args):
     aws("iam", "detach-role-policy", "--role-name", prefix + "-agent", "--policy-arn", outputs["SubmitDenyArn"])
     aws("cloudformation", "delete-stack", "--stack-name", prefix + "-cloud")
     aws("cloudformation", "wait", "stack-delete-complete", "--stack-name", prefix + "-cloud", parse=False)
-    # The stack removes only its own current revision; agents registered the others.
-    for definition in settings.active_definitions(aws, values["RUN_JOB_DEFINITION"]):
-        aws("batch", "deregister-job-definition", "--job-definition", definition["jobDefinitionArn"])
-    print("retire: deleted %s-cloud and its job definitions. Kept, and still billed for storage: bucket %s and "
-          "image repository %s (delete them in the S3 and ECR consoles when you no longer need the results). "
-          "Also left: the latch parameter %s, the %s-agent profile in your AWS config and %s."
-          % (prefix, values["BUCKET"], values["REPOSITORY"], values["STATE_PARAMETER"], prefix, values["_path"]))
-    return 0
+
+
+def delete_data(aws, values, prefix):
+    """--delete-data: delete what the stack keeps, then the local settings. Safe to rerun."""
+    bucket = values["BUCKET"]
+    deleted = 0
+    with tempfile.TemporaryDirectory() as scratch:
+        batch = Path(scratch) / "delete.json"
+        while True:
+            try:
+                listing = aws("s3api", "list-object-versions", "--bucket", bucket, "--max-items", "1000")
+            except settings.AwsError as error:
+                if "NoSuchBucket" in error.message:
+                    break
+                raise
+            objects = [{"Key": item["Key"], "VersionId": item["VersionId"]}
+                       for item in (listing.get("Versions") or []) + (listing.get("DeleteMarkers") or [])]
+            if not objects:
+                aws("s3api", "delete-bucket", "--bucket", bucket)
+                break
+            for start in range(0, len(objects), 1000):
+                batch.write_text(json.dumps({"Objects": objects[start:start + 1000], "Quiet": True}))
+                result = aws("s3api", "delete-objects", "--bucket", bucket, "--delete", "file://" + str(batch))
+                if result.get("Errors"):
+                    die("could not delete objects in %s: %s; rerun retire --delete-data"
+                        % (bucket, json.dumps(result["Errors"][:3])))
+                deleted += min(1000, len(objects) - start)
+            print("retire: deleted %d object versions from %s" % (deleted, bucket), flush=True)
+    print("retire: bucket %s is gone" % bucket, flush=True)
+    for command, missing in ((("ecr", "delete-repository", "--repository-name", prefix + "-worker", "--force"),
+                              "RepositoryNotFoundException"),
+                             (("ssm", "delete-parameter", "--name", values["STATE_PARAMETER"]), "ParameterNotFound")):
+        try:
+            aws(*command)
+        except settings.AwsError as error:
+            if missing not in error.message:
+                raise
+    print("retire: image repository %s-worker and parameter %s are gone" % (prefix, values["STATE_PARAMETER"]),
+          flush=True)
+    removed = remove_profile(prefix + "-agent")
+    directory = settings.identity_dir(prefix)
+    for name in ("ca.pem", "agent.pem", "agent.key"):
+        if (directory / name).exists():
+            (directory / name).unlink()
+    if directory.is_dir() and not any(directory.iterdir()):
+        directory.rmdir()
+    Path(values["_path"]).unlink()
+    print("retire: removed %s, the agent certificate (if any) and %s. Left on this machine: receipts and "
+          "acceptance results in %s, and local container images."
+          % ("the %s-agent profile from %s" % (prefix, removed) if removed else "no agent profile",
+             values["_path"], Path(values["_path"]).parent))
+
+
+def remove_profile(name):
+    """Delete [profile name] from the AWS CLI config, keeping every other line as it was."""
+    config_path = Path(os.environ.get("AWS_CONFIG_FILE") or Path.home() / ".aws/config")
+    if not config_path.exists():
+        return None
+    lines = config_path.read_text().splitlines(keepends=True)
+    kept, inside, found = [], False, False
+    for line in lines:
+        header = re.match(r"\s*\[(.*)\]\s*$", line)
+        if header:
+            inside = header.group(1).strip() == "profile " + name
+            found = found or inside
+        if not inside:
+            kept.append(line)
+    if not found:
+        return None
+    config_path.write_text("".join(kept))
+    return config_path
 
 
 def locked(action, args):
@@ -692,9 +776,15 @@ def add_arguments(commands):
                                            "cutoff first (`cloudsweep deploy --cutoff`) if spend is above it.")
     reset.add_argument("--admin-profile")
     reset.set_defaults(handler=lambda args: locked(reset_cutoff, args))
-    gone = actions.add_parser("retire", help="stop all work and delete the stack (bucket and images are kept)")
+    gone = actions.add_parser("retire", help="stop all work and delete the stack (bucket and images are kept)",
+                              description="Stop all work, wait for the instances to go, and delete the stack and "
+                                          "job definitions. The bucket, image repository, cutoff parameter, agent "
+                                          "profile and deploy.env are kept unless you add --delete-data.")
     gone.add_argument("--admin-profile")
-    gone.add_argument("--yes", action="store_true")
+    gone.add_argument("--yes", action="store_true", help="confirm")
+    gone.add_argument("--delete-data", action="store_true",
+                      help="also delete the bucket with every result in it, the image repository, the cutoff "
+                           "parameter, the agent profile and certificate, and deploy.env")
     gone.set_defaults(handler=lambda args: locked(retire, args))
 
 

@@ -50,8 +50,8 @@ small instances.
 
 | Resource | Purpose |
 |---|---|
-| S3 bucket `<name>-<account>-<region>` | inputs, sweep files, results; versioned; kept after `retire` |
-| ECR repository `<name>-worker` | base and revision images; tags cannot be overwritten; kept after `retire` |
+| S3 bucket `<name>-<account>-<region>` | inputs, sweep files, results; versioned; kept after `retire` unless `--delete-data` |
+| ECR repository `<name>-worker` | base and revision images; tags cannot be overwritten; kept after `retire` unless `--delete-data` |
 | Batch compute environment and queue | On-Demand EC2, minimum 0 vCPUs, maximum the cap |
 | Run job definition | the only container settings jobs can use: UID 1000, not privileged, no host mounts |
 | Agent role and profile | what day-to-day commands can do (see [How it works](how-it-works.md#permissions)) |
@@ -127,17 +127,25 @@ Either way, the agent role can only do what [How it works](how-it-works.md#permi
 These limits are enforced by cloudsweep on the machine where it runs, not by AWS. The cap and the
 cutoff are enforced by AWS.
 
-## retire removes the deployment and keeps your results
+## retire removes the deployment and keeps your results, unless you ask
 
 ```bash
-cloudsweep admin retire --admin-profile admin --yes
+cloudsweep admin retire --admin-profile admin --yes                 # keep results and images
+cloudsweep admin retire --admin-profile admin --yes --delete-data   # delete everything
 ```
 
 This sets cloud use off, blocks submission, stops all jobs, waits until no instance is left (up to
-30 minutes), and deletes the stack and every job definition. The bucket and the image repository
-are kept, and you keep paying for their storage until you delete them in the S3 and ECR consoles.
-Also left in place: the cutoff parameter, the agent profile in `~/.aws/config`, and
-`.cloudsweep/deploy.env`.
+30 minutes), and deletes the stack and every job definition. It takes about ten minutes.
+
+Without `--delete-data`, the bucket and the image repository are kept, and you keep paying for
+their storage until you delete them. Also left in place: the cutoff parameter, the agent profile in
+`~/.aws/config`, and `.cloudsweep/deploy.env`.
+
+With `--delete-data`, retire then also deletes every object version in the bucket and the bucket
+itself, the image repository, the cutoff parameter, the agent profile and certificate, and
+`.cloudsweep/deploy.env`. **The results in the bucket cannot be recovered**, so fetch what you need
+first. Receipts and acceptance results in `.cloudsweep/` and local container images stay. If it
+stops partway, run the same command again: it continues from where it stopped.
 
 ## Using one deployment from another machine
 
