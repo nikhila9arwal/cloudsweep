@@ -126,4 +126,4 @@ that holds other work.
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and tests, and
 [SECURITY.md](SECURITY.md) to report a vulnerability. cloudsweep is released under the
-[MIT License](LICENSE).
+[Apache License 2.0](LICENSE).

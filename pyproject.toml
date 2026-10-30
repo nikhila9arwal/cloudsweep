@@ -7,7 +7,7 @@ name = "cloudsweep"
 version = "0.1.0"
 description = "Run simulator sweeps on AWS Batch from a Git project, within a budget"
 readme = "README.md"
-license = {text = "MIT"}
+license = {text = "Apache-2.0"}
 requires-python = ">=3.9"
 dependencies = []
 keywords = ["aws", "batch", "simulation", "parameter-sweep", "reproducibility"]
@@ -15,7 +15,7 @@ classifiers = [
     "Development Status :: 3 - Alpha",
     "Environment :: Console",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "License :: OSI Approved :: Apache Software License",
     "Operating System :: POSIX",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering",

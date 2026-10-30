@@ -1,7 +1,8 @@
 # Contributing
 
 Bug reports, fixes and documentation improvements are welcome. For a larger change, open an issue
-first to agree on the approach.
+first to agree on the approach. Contributions are accepted under the project's
+[Apache License 2.0](LICENSE).
 
 ## Development setup
 
