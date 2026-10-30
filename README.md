@@ -1,5 +1,7 @@
 # cloudsweep
 
+[![CI](https://github.com/nikhila9arwal/cloudsweep/actions/workflows/ci.yml/badge.svg)](https://github.com/nikhila9arwal/cloudsweep/actions/workflows/ci.yml)
+
 cloudsweep runs a simulator's parameter sweeps on AWS Batch, straight from a Git project. You
 commit your code and run one command. Each point of the sweep then runs in a clean container
 built from that commit, and you get back verified result files. The AWS machines start only while
@@ -31,13 +33,13 @@ your Git repo ──commit──▶ revision image ──▶ AWS Batch queue ─
   agent profile that deploy creates.
 - Your simulator in a Git repository.
 
-Install from a clone:
+Install it:
 
 ```bash
-pip install /path/to/cloudsweep      # your clone of this repository
+pip install git+https://github.com/nikhila9arwal/cloudsweep
 ```
 
-Or run it without installing it: put `cloudsweep/bin` on your `PATH`.
+Or clone the repository and put its `bin/` directory on your `PATH`; nothing else is needed.
 
 ## Quick start
 
@@ -113,11 +115,15 @@ the tag gets activated.
 - The program inside the image must run on Linux for the deployment's CPU architecture: x86_64,
   or arm64 if you deploy Graviton instance types.
 
-## Development
+## Status
 
-```bash
-python3 -m unittest discover -s tests     # offline; the template tests need PyYAML
-```
+Version 0.1.0 is new. It has been tested end to end on AWS in one configuration (us-east-1, m7a
+instances, the assume-role identity); see the [changelog](CHANGELOG.md) for what has and has not
+been exercised. Read [How it works](docs/how-it-works.md) before you deploy it into an account
+that holds other work.
 
-The tests use stubs in place of AWS and need no account. A change to `stack.yaml` should also pass
-[cfn-lint](https://github.com/aws-cloudformation/cfn-lint).
+## Contributing and license
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for the development setup and tests, and
+[SECURITY.md](SECURITY.md) to report a vulnerability. cloudsweep is released under the
+[MIT License](LICENSE).
