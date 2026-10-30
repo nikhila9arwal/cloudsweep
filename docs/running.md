@@ -1,125 +1,127 @@
 # Running work
 
-Run every command from inside your project's checkout. Git worktrees of the same repository share
-one deployment: the settings live in `.cloudsweep/` of the main checkout.
+Run commands inside your project's Git checkout. Worktrees share the deployment settings in
+`.cloudsweep/` of the main checkout. `cloudsweep doctor` checks prerequisites and reports fixes.
 
-## try runs commands locally, in the container that AWS would use
+## Commands and inputs
+
+Commands are argument lists, executed without a shell in the checkout. Use `["sh", "-c", "..."]`
+for shell syntax. A sweep file contains one JSON argument list per line; blank lines and lines
+starting with `#` are ignored. Up to 10,000 commands are supported. Multiple commands become one
+Batch array job, with one child per command. See the [sweep generator](../examples/cache-sim/configs/make_sweep.py).
+
+| Placeholder | Value |
+|---|---|
+| `{bin}` | `/work/src/<[build] binary>` |
+| `{out}` | the attempt's output directory; write results here |
+| `{src}` | `/work/src`, the checkout and working directory |
+| `{index}` | command index, starting at 0; useful as a seed |
+| `{input:NAME}` | path of the input named NAME |
+| `{{`, `}}` | literal braces |
+
+Pass external files with repeatable `--input PATH[=NAME]`. Without NAME, PATH must be inside the
+checkout and keeps its repository-relative location: `--input traces/a.txt` becomes
+`/work/src/traces/a.txt`. Use NAME for files outside the checkout. Inputs are uploaded by content
+hash and reused; they cannot replace tracked files or files already in the revision image.
+
+## try
 
 ```bash
 cloudsweep try -- {bin} --sets 64 --out {out}
-cloudsweep try --commands sweep.jsonl --input traces/a.txt --keep /tmp/trial
+cloudsweep try --commands sweep.jsonl --input traces/a.txt --keep trial-results
 ```
 
-`try` builds the revision image for the commit and runs each command through the worker on your
-machine, one after another, with no network inside the container and with the same time limit. It then checks the results the
-same way `fetch` does. It uses the local base image from `cloudsweep image build`, or else pulls the
-newest published one. Use `try` to find a wrong path or a missing library before you pay for it.
+`try` builds the revision and runs commands sequentially through the worker, without container
+network access, then verifies results as `fetch` does. It uses the locally built base image,
+otherwise pulls the newest published base. The time limit applies locally; AWS CPU and memory
+reservations do not. Use it to catch missing files and libraries before paying for AWS runs.
 
-## submit runs a commit's commands on AWS Batch
+## submit
 
 ```bash
-cloudsweep submit --hours 2 -- {bin} --sets 64 --out {out}           # one command
-cloudsweep submit --hours 2 --commands sweep.jsonl --input traces/a.txt
-cloudsweep submit --dry-run --commands sweep.jsonl                    # plan and estimate only
+cloudsweep submit --hours 2 -- {bin} --sets 64 --out {out}
+cloudsweep submit --dry-run --commands sweep.jsonl --input traces/a.txt
+cloudsweep submit --commands sweep.jsonl --input traces/a.txt
 ```
+
+**AWS runs cost money.** `--dry-run` checks and estimates without building, uploading or submitting.
+See [costs and limits](admin.md#costs-and-limits) for the estimate, ceiling and billing gaps.
 
 | Option | Meaning |
 |---|---|
-| `--hours H` | time limit for each command; a command that runs longer is stopped (60 s to 14 days) |
-| `--vcpus N`, `--memory-mib M` | what each command reserves (defaults from `[run]`, else 1 and 3500) |
-| `--revision REV` | the commit to run (default `HEAD`) |
-| `--input PATH[=NAME]` | a file to place in the checkout; repeatable |
-| `--isolated` | one command per largest instance, nothing beside it: for timing measurements |
-| `--label TEXT` | free text kept with the submission |
+| `--hours H` | per-command time limit: 60 seconds to 14 days; defaults to `[run] hours` |
+| `--vcpus N`, `--memory-mib M` | per-command reservations; defaults from `[run]`, else 1 and 3500 |
+| `--revision REV` | committed revision; default `HEAD` |
+| `--isolated` | reserve the largest deployed instance's CPU and usable memory per command |
+| `--label TEXT` | label saved with the submission |
 
-A sweep file holds one command per line, each a JSON list. Lines starting with `#` are ignored. A
-sweep becomes one Batch array job, with one child per line. A sweep can have at most 10,000 lines.
-A short script that writes the file is usually the clearest way to define a sweep
-([example](../examples/cache-sim/configs/make_sweep.py)).
+Commit tracked changes and `cloudsweep.ini` first. Unknown placeholders, disabled cloud use,
+an active cutoff, requests that do not fit the instance types or cap, and costs above the
+per-run ceiling are refused.
 
-`submit` refuses, and says why, when:
+Submission prints its ID, planned instance type and cost estimates, and writes a receipt under
+`.cloudsweep/receipts/`. **If the outcome is unknown, inspect that receipt and `cloudsweep status`
+before retrying.** cloudsweep does not automatically resubmit; rerunning `submit` can duplicate work.
 
-- tracked files have uncommitted changes (a run uses committed source only);
-- the commit has no `cloudsweep.ini`, or a command names an unknown placeholder;
-- cloud use is off (`CLOUDSWEEP_ENABLED=0` in `.cloudsweep/deploy.env`), or the budget cutoff is
-  active;
-- no deployed instance type can hold the requested vCPUs and memory, or the instance it needs is
-  larger than the vCPU cap;
-- the worst-case cost of one command is above `CLOUDSWEEP_MAX_RUN_USD` (see below).
+### Sizing
 
-When it succeeds, it prints the submission ID (for example `20261029T205712Z-1fad4b`), the instance
-type, and a cost estimate. It also writes a receipt to `.cloudsweep/receipts/`. If the connection
-drops during submission, the receipt records what was intended. cloudsweep never resubmits
-automatically, so a retry cannot start the work twice.
+Batch packs commands by their CPU and memory reservations. Two 1-vCPU commands can share a 2-vCPU
+instance's caches and memory bandwidth. For timing measurements, reserve all an instance's vCPUs
+or use `--isolated`. cloudsweep assumes 90% of memory is usable: 3,500 MiB fits on an 8 GiB instance;
+7,500 MiB needs a larger one. Packing and shorter runtimes can reduce costs.
 
-### Sizing: commands share instances unless they ask for a whole one
-
-Batch packs commands onto instances by their vCPU and memory reservations. Two 1-vCPU commands can
-run on one 2-vCPU instance and share its memory bandwidth and caches. Packing is cheapest. If
-run-to-run timing matters, reserve all of an instance's vCPUs (`--vcpus 2` on a 2-vCPU type) or use
-`--isolated`. About 90% of an instance's memory is assumed usable by jobs, so a 3,500 MiB command
-fits on an 8 GiB instance and a 7,500 MiB one needs the next size up.
-
-`submit` prints two figures per command. The *estimate* is the price of the whole cheapest instance
-that fits the command, multiplied by its time limit. The *worst case* is the price of the most
-expensive deployed instance type that fits, times the same limit: Batch places a job on a larger
-instance when the best-fitting size is short of capacity. The ceiling is checked against the worst
-case. Commands that share an instance, or finish early, cost less than the estimate. A retry after
-a host failure, instance start-up time, and idle time before an instance stops add to both. If the
-worst case blocks long runs, deploy without the largest types or raise the ceiling.
-
-## status shows jobs, capacity and reported spend
+## status
 
 ```bash
-cloudsweep status                    # every submission still in the queue's history
-cloudsweep status <submission>
-cloudsweep status --storage          # bytes kept in the bucket and registry
+cloudsweep status                     # submissions in the queue's history
+cloudsweep status SUBMISSION
+cloudsweep status --storage           # retained bucket objects and registry images
 ```
 
-Desired capacity is what Batch has asked EC2 for. It is not a count of running instances. Reported
-spend comes from AWS Budgets through the guard, which reads it every five minutes, and it lags real
-usage by hours.
+Desired capacity is what Batch requested, not the number of running instances. Spend comes from
+the guard's [budget snapshot](admin.md#costs-and-limits) and lags usage. Status remains available
+when cloud use is off or the cutoff is active.
 
-## fetch downloads results and verifies every file
+## fetch
 
 ```bash
-cloudsweep fetch <submission> --wait          # wait until finished (up to a day), then fetch
-cloudsweep fetch <submission> results/        # into results/<submission>/
+cloudsweep fetch SUBMISSION --wait     # wait up to a day
+cloudsweep fetch SUBMISSION results/   # download into results/SUBMISSION/
 ```
 
-Results go to `cloudsweep-results/<submission>/` unless you name another directory:
+**Results count only when `fetch` reports `complete`** (exit status 0): every command must have a
+verified successful attempt. Batch finishing is insufficient. See the
+[verification checks](how-it-works.md#verification).
 
+The default destination is `cloudsweep-results/SUBMISSION/`:
+
+```text
+SUBMISSION/
+  submission.json       commit, image, recipe, inputs, resources
+  commands.jsonl        submitted commands
+  fetch.json            verdicts and verification problems
+  0/                    command index
+    1/                  attempt number
+      manifest.json     status, exit code, timing, provenance, file hashes
+      started.json      start and host details
+      stdout.txt
+      stderr.txt
+      out/              files written to {out}
 ```
-<submission>/
-  submission.json            what ran: commit, image digest, recipe, inputs, resources
-  commands.jsonl             the sweep, exactly as submitted
-  fetch.json                 the verdict for every command
-  0/                         command 0
-    1/                       attempt 1 (a host-failure retry is 2; a rerun of the same attempt is 1-2)
-      manifest.json          status, exit code, timing, host, and SHA-256 of every file
-      started.json
-      stdout.txt  stderr.txt
-      out/                   what the command wrote to {out}
-  1/ ...
-```
 
-Each file is checked against the size and SHA-256 that the worker recorded. A successful attempt
-must also name the submitted commit, image and binary. `fetch` exits with status 0 only if every
-command has a verified successful attempt. An attempt without `manifest.json` is incomplete: the
-container was stopped before it finished uploading. `fetch` downloads what exists and reports it
-as incomplete. Running `fetch` again is safe. It never overwrites a local file with different
-content.
+An attempt without `manifest.json` is incomplete. `fetch` downloads available files and reports
+missing, skipped or invalid outputs. Fetching again never overwrites a local file with different
+content. See [output limits](../README.md#limits) and [retry directories](how-it-works.md#retries).
 
-## cancel stops a submission, or everything
+## cancel
 
 ```bash
-cloudsweep cancel <submission>
-cloudsweep cancel --all --wait 30        # and wait until no instance is left
+cloudsweep cancel SUBMISSION
+cloudsweep cancel --all --wait 30      # wait up to 30 minutes for capacity to reach zero
 ```
 
-Waiting commands are cancelled, and running ones are stopped. A command receives SIGTERM and has
-20 seconds to exit before it is killed. The worker then uploads what the command wrote to `{out}`,
-but Batch kills the container 30 seconds after SIGTERM, so this upload is best effort: large
-outputs may not finish. A command that must keep partial results should write them as it goes and
-expect only some of them back.
-Cancelling works when cloud use is off and when the cutoff is active.
+Waiting jobs are cancelled; active jobs are stopped. The command gets SIGTERM and 20 seconds to
+exit before being killed. The worker then attempts to upload outputs, but Batch kills the
+container after 30 seconds: partial results are best effort. Write them incrementally and expect
+some to be missing. Cancellation reports remaining capacity and works when cloud use is off
+or the cutoff is active.

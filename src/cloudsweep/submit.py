@@ -1,27 +1,15 @@
-"""Run one command, or a manifest of commands (one array job), on AWS Batch:
+"""Run committed commands on AWS Batch (billable).
 
   cloudsweep submit --hours 2 -- {bin} --config configs/a.yaml --out {out}
   cloudsweep submit --hours 2 --commands sweep.jsonl --input data/trace.bin
 
-Each command is an argv list run in a clean checkout of --revision (default HEAD), a
-commit: uncommitted changes to tracked files are refused, never sent. A manifest holds one
-JSON argv list per line; child i runs line i. Placeholders:
-  {bin}         the program named by [build] binary, built from that revision
-  {out}         the attempt's output directory; everything written there is uploaded
-  {src}         the checkout (also the working directory)
-  {index}       the child's index in the manifest (0, 1, ...)
-  {input:NAME}  the path of an --input file
-Write {{ and }} for literal braces. Each --input PATH is placed at its repository-relative
-path inside the checkout, so relative paths work unchanged; PATH=NAME names it explicitly.
+Sweep files contain one JSON argument list per line. Tracked edits are refused.
+Placeholders: {bin} program, {out} outputs, {src} checkout, {index} zero-based command
+index, {input:NAME} input path. Use {{ and }} for literal braces.
 
-Each commit is built once, FROM the newest published base image, and reused after that.
-The per-run ceiling (CLOUDSWEEP_MAX_RUN_USD) charges each run the whole cheapest instance
-that fits it for its time limit; runs sharing an instance cost less, while a host-failure
-retry, startup and idle time add. Runs share instances by default; to give each run a
-machine of its own, request all of an instance's vCPUs (--vcpus) or use --isolated.
-
-try runs the same thing on this machine, in the same container, with no AWS calls when a
-local base image exists: use it to check a command before paying for it.
+The local per-run ceiling checks the most expensive fitting deployed instance for
+the time limit. Retries, startup, idle time and non-compute charges are additional.
+See docs/admin.md for cost controls and gaps; docs/running.md for commands and sizing.
 """
 
 import argparse
@@ -294,10 +282,9 @@ def add_arguments(commands):
     parser.set_defaults(handler=lambda args: (check_command_args(parser, args), main(args))[1])
 
     trial_parser = commands.add_parser(
-        "try", help="run commands locally in the same container, without AWS",
-        description="Build the revision image and run the commands through the worker on this machine, "
-                    "as Batch would, then verify the results like fetch. Uses the local base image from "
-                    "`cloudsweep image build`, else pulls the newest published one.")
+        "try", help="run and verify commands locally in a container",
+        description="Build and run locally, then verify results. Uses the local base image if available, "
+                    "else pulls the newest published base. Enforces the time limit, not AWS CPU/memory reservations.")
     add_common(trial_parser)
     trial_parser.add_argument("--keep", help="new directory for the local store and results (default: a temporary one)")
     trial_parser.set_defaults(vcpus=None, memory_mib=None,

@@ -1,14 +1,5 @@
-"""cloudsweep status and cloudsweep cancel.
-
-status reports jobs, desired capacity and reported month-to-date spend. Reported spend
-comes from AWS Budgets through the guard's snapshot; billing data arrive hours after usage,
-so it lags the work shown above it. It works when cloud use is off or the cutoff is latched.
---storage inventories retained objects and images instead of jobs.
-
-cancel stops one submission's jobs, or all work, then reports remaining capacity. Waiting
-jobs are cancelled and starting or running ones terminated, array children included. The
-deployment's control function does this and acts only on jobs in its own queue. Cancelling
-stays available when cloud use is off or the cutoff is latched.
+"""Show jobs, desired capacity and reported monthly spend, which lags usage by hours.
+Works when cloud use is off or the cutoff is active. --storage inventories retained data.
 """
 
 import argparse
@@ -170,7 +161,10 @@ def add_arguments(commands):
     parser.set_defaults(handler=status)
 
     stop = commands.add_parser("cancel", help="stop a submission, or all work",
-                               description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+                               description="Stop jobs in this deployment's queue, including array children.\n"
+                                           "Cancellation works when cloud use is off or the cutoff is active.\n"
+                                           "Partial output uploads are best effort.",
+                               formatter_class=argparse.RawDescriptionHelpFormatter)
     target = stop.add_mutually_exclusive_group(required=True)
     target.add_argument("submission", nargs="?")
     target.add_argument("--all", action="store_true", help="all work in the queue")

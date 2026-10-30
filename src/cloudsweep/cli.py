@@ -1,15 +1,8 @@
-"""cloudsweep: run simulator sweeps on AWS Batch from a Git project, within a budget.
+"""cloudsweep: run parameter sweeps on AWS Batch from committed source.
 
-Typical first use, from your project's checkout:
-  cloudsweep init                       write cloudsweep.ini and a toolchain Dockerfile
-  cloudsweep deploy --email you@x.org   (administrator) create the AWS resources
-  cloudsweep image build                build your toolchain image with the worker, check it
-  cloudsweep image publish              push it to the deployment's registry
-  cloudsweep try -- {bin} --quick       run a command locally in that container, for free
-  cloudsweep submit --commands sweep.jsonl --hours 2
-  cloudsweep status                     jobs, capacity and spend
-  cloudsweep fetch SUBMISSION --wait    download and verify the results
-Run `cloudsweep doctor` whenever something does not work.
+Start with the README quick start. For your own project, run cloudsweep init.
+Use cloudsweep COMMAND --help for options and cloudsweep doctor to diagnose failures.
+AWS resources cost money; see docs/admin.md for spending limits and cleanup.
 """
 
 import argparse

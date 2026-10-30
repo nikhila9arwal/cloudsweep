@@ -1,11 +1,8 @@
-"""cloudsweep fetch: download a submission's attempts, verify them and lay them out locally.
+"""Download attempts into DEST/SUBMISSION/ and verify file hashes and provenance.
 
-Writes DEST/SUBMISSION/ with the submission manifest, its commands, and every attempt as
-CHILD/ATTEMPT/ (outputs under out/, stdout.txt, stderr.txt, started.json, manifest.json).
-Each file named by an attempt's manifest is checked against its sha256 and size. An
-attempt without manifest.json is incomplete evidence even if Batch reports the job ended;
-it is downloaded as found and reported. Existing local files are never overwritten with
-different content. Exits 0 only when every child has a verified succeeded attempt.
+Results count only when fetch reports complete (exit 0): every command has a verified
+successful attempt. Missing manifests mean incomplete results. Existing files with
+different content are never overwritten. See docs/running.md for the result layout.
 """
 
 import json

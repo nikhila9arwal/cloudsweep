@@ -1,22 +1,22 @@
 # Security
 
-cloudsweep creates IAM roles and policies in your AWS account and runs your code on EC2 instances.
-A flaw in either can cost money or expose data, so please report suspected problems privately.
+cloudsweep creates IAM policies and runs code in your AWS account. Flaws can expose data or cost
+money. Treat images and submitted programs as trusted code; see the
+[permissions and isolation limits](docs/how-it-works.md#permissions).
 
 ## Reporting a vulnerability
 
-Use GitHub's private vulnerability reporting: the **Security** tab of this repository, then
-**Report a vulnerability**. Please do not open a public issue. Include what an attacker needs (for
-example, the agent profile, or the ability to commit to the project) and what they gain.
+Use this repository's **Security → Report a vulnerability** to report privately, not a public
+issue. Include the access an attacker needs (such as the agent profile or project commit access)
+and what they can do with it.
 
-## What is in scope
+## Scope
 
-- The IAM permissions in `src/cloudsweep/stack.yaml`: anything that lets the agent profile or a job
-  do more than [How it works](docs/how-it-works.md#permissions) says.
-- Ways around the cost controls: the vCPU cap, the per-run ceiling, or the budget cutoff.
-- Ways for a job to read or change another job's inputs or results, or to use the instance's
-  credentials.
-- Result verification that `fetch` accepts when it should not.
+- Access beyond the documented agent and job permissions in `src/cloudsweep/stack.yaml`.
+- Bypasses of the intended vCPU cap, local per-run ceiling or budget cutoff.
+- Access to instance credentials beyond the documented metadata-service limitation.
+- Invalid results accepted by `fetch`.
 
-The documented gaps in [How it works](docs/how-it-works.md#cost-controls-and-their-gaps) are known
-limits, not vulnerabilities. Reports about them are still welcome if you see a way to close one.
+Jobs share a role with deployment-wide input reads and result writes; per-job S3 isolation is
+not provided. This and the [spending-control gaps](docs/admin.md#costs-and-limits) are known
+limitations. Suggestions to close them are welcome.

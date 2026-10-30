@@ -1,12 +1,9 @@
-"""cloudsweep image: build, check and publish the base image.
+"""Build, check and publish your toolchain image.
 
-  cloudsweep image build      build [image] dockerfile, add the worker, run the toolchain
-                              check and, when [acceptance] is configured, the acceptance run
-  cloudsweep image publish    push the accepted local base image to the deployment's registry
+  cloudsweep image build      build the Dockerfile and add/check the worker
+  cloudsweep image publish    push the checked image to the registry
 
-The base image changes only when the toolchain changes; each commit you submit is built
-FROM the newest published base. A run of the acceptance command checks that a new base
-still produces the known result before anything runs on it.
+When [acceptance] is configured, build runs it and publish requires a passing result.
 """
 
 import argparse

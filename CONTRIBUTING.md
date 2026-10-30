@@ -1,39 +1,37 @@
 # Contributing
 
-Bug reports, fixes and documentation improvements are welcome. For a larger change, open an issue
-first to agree on the approach. Contributions are accepted under the project's
-[Apache License 2.0](LICENSE).
+Bug reports, fixes and documentation improvements are welcome. Open an issue before larger
+changes to agree on the approach. Contributions use [Apache-2.0](LICENSE).
 
 ## Development setup
 
 ```bash
-git clone https://github.com/nikhila9arwal/cloudsweep && cd cloudsweep
-python3 -m venv .venv && . .venv/bin/activate
+git clone https://github.com/nikhila9arwal/cloudsweep
+cd cloudsweep
+python3 -m venv .venv
+. .venv/bin/activate
 pip install -e . pyyaml cfn-lint
-python3 -m unittest discover -s tests      # offline; no AWS account needed
-cfn-lint src/cloudsweep/stack.yaml         # after any change to the template
+python3 -m unittest discover -s tests
+cfn-lint src/cloudsweep/stack.yaml
 ```
 
-The tests replace AWS with stubs. The worker tests run the real worker against a local store, and
-the S3 client's signatures are checked against known-good values.
-
-To try a change end to end without AWS, use the [example project](examples/cache-sim/):
-`cloudsweep image build` and `cloudsweep try` run everything locally in Docker or Podman.
+Tests run offline: they stub AWS, exercise the worker against a local store, and check S3
+signatures against known values. Run `cfn-lint` after template changes. The
+[example project](examples/cache-sim/) exercises image building and local execution with Docker
+or Podman, without AWS.
 
 ## Code
 
-- No runtime dependencies. The CLI uses the Python standard library and the AWS CLI.
-- `core.py`, `worker.py` and `s3lite.py` are copied into users' images. They must run on
-  Python 3.8 with the standard library only.
-- Every command refuses with a message that says what to do instead. Keep that true for new
-  failure cases.
-- A change to what the agent role or the jobs can do belongs in `stack.yaml`, with a test in
-  `tests/test_cli.py` and an update to [How it works](docs/how-it-works.md#permissions).
-- Add a test with each fix. Update the documentation in the same change when behavior changes.
+- Keep runtime Python dependencies to the standard library; the CLI also uses the AWS CLI.
+- `core.py`, `worker.py` and `s3lite.py` go into users' images and must support Python 3.8.
+- Refusals should explain what to do next.
+- Permission changes belong in `stack.yaml`, with tests in `tests/test_cli.py` and matching
+  [permissions documentation](docs/how-it-works.md#permissions).
+- Include a test with each fix and update documentation when behavior changes.
 
-## Testing against AWS
+## AWS validation
 
-A change to deployment, submission or the guard should also be run against a real account before
-release: `deploy` with a new `--prefix`, the example sweep, `cancel`, and
-`admin retire --yes --delete-data`. That cycle costs well under a dollar. Remove account IDs and
-resource names from any output you paste into an issue or pull request.
+Before releasing deployment, submission or guard changes, use a separate `--prefix`: deploy,
+run the example sweep, cancel, then [retire](docs/admin.md#retire). This costs money; see
+[costs and limits](docs/admin.md#costs-and-limits). `retire --yes --delete-data` permanently deletes
+test results. Remove personal information and account/resource identifiers from shared output.

@@ -1,156 +1,147 @@
 # Administration
 
-The administrator deploys the AWS resources once, sets the limits, and is the only person who can
-lift a budget cutoff or remove the deployment. All of this runs through `cloudsweep deploy` and
-`cloudsweep admin`, with an AWS CLI profile that has administrator rights. Give it with
-`--admin-profile`, or set `CLOUDSWEEP_ADMIN_PROFILE`; the default is the profile named `default`.
+Use an administrator AWS CLI profile for `deploy` and `admin`: pass `--admin-profile`, or set
+`CLOUDSWEEP_ADMIN_PROFILE` (default profile: `default`). Only the administrator can change AWS
+limits, lift a cutoff or remove the deployment.
 
-## deploy creates everything, and reruns change settings
+## deploy
 
 ```bash
 cloudsweep deploy --admin-profile admin --email you@example.org
 ```
 
-The first deploy takes about five minutes. Before creating anything, it checks that the account's
-Lambda concurrency quota leaves room for the guard (new accounts sometimes have a quota of 10; the
-message says how to request more). It:
+Deployment creates billable resources and takes about five minutes initially. Prerequisites:
 
-1. finds the region's default VPC and its subnets (or uses `--vpc` and `--subnets`) and checks that
-   the subnets give instances public addresses and a route to the internet: instances need it to
-   pull images and reach S3, and they accept no inbound connections;
-2. reads each instance type's vCPUs, memory, architecture and On-Demand price from AWS;
-3. creates a CloudFormation stack named `<name>-cloud` (listed below);
-4. adds an AWS CLI profile `<name>-agent` to `~/.aws/config` for day-to-day commands;
-5. writes `.cloudsweep/deploy.env` in your project, with `CLOUDSWEEP_ENABLED=1` and
-   `CLOUDSWEEP_MAX_RUN_USD=10`;
-6. checks that the agent profile works.
+- At least 101 unreserved Lambda executions: the guard reserves one and AWS keeps 100 unreserved.
+  `deploy` checks this; new accounts may need a quota increase.
+- Public subnets with public IPv4 assignment and an internet-gateway route for image pulls and S3.
+  Workers accept no inbound connections. Use the default VPC or pass `--vpc` and `--subnets`.
 
-Rerun `deploy` with only the options you want to change; every other setting keeps its current
-value. A rerun updates the deployment recorded in `.cloudsweep/deploy.env` (its name and region)
-unless you pass `--prefix` or `--region`:
+`deploy` reads instance CPU, memory, architecture and On-Demand prices; creates the
+`<name>-cloud` stack; writes and checks the `<name>-agent` profile in `~/.aws/config`; and saves
+local settings in `.cloudsweep/deploy.env`. Confirm the AWS subscription email to receive
+guard warnings.
 
-| Option | Default |
+Reruns preserve omitted settings. They target the recorded deployment unless overridden:
+
+| Option | Initial default |
 |---|---|
-| `--region` | the recorded deployment's region, else the admin profile's, else `us-east-1` |
+| `--prefix` | `[project] name`; on reruns, recorded name |
+| `--region` | recorded region for that name, else admin profile's region, else `us-east-1` |
 | `--instance-types` | `m7a.large,m7a.xlarge,m7a.2xlarge,m7a.4xlarge` |
-| `--max-vcpus` | 32 |
-| `--alerts A1,A2` and `--cutoff C` | 50,80 and 100 (USD per month) |
-| `--disk-gib` | 60 (root disk per instance: image layers, checkout, outputs) |
-| `--identity` | `assume-role` (see below) |
-| `--price TYPE=USD` | read from the AWS Price List API; give it only if that read fails |
+| `--disk-gib` | 60 per instance: root disk for image layers, checkout and outputs |
+| `--identity` | `assume-role` |
+| `--price TYPE=USD` | Price List API; override only if that lookup fails |
 
-Choose instance types by what your commands need per vCPU. m7a and m8a have 4 GiB per vCPU, r7a and
-r8a have 8 GiB, and c7a has 2 GiB. On these AMD types, one vCPU is one physical core. On Intel types
-(m7i, c7i, ...) a vCPU is a hyperthread. Graviton types (m7g, c8g, ...) need an arm64 image:
-cloudsweep builds for the deployment's architecture, which needs QEMU emulation on an x86 machine.
-All listed types must share one architecture. Include a range of sizes so that small commands get
-small instances.
+All types must share an architecture. Include small and large sizes so small jobs can use small
+instances. m7a/m8a have 4 GiB per vCPU, r7a/r8a have 8, and c7a has 2; each vCPU is a physical
+core on these AMD types. On m7i/c7i, a vCPU is a hyperthread. Graviton needs arm64 images;
+building them on x86 needs emulation such as QEMU.
 
-## What the stack contains
+## Resources
 
 | Resource | Purpose |
 |---|---|
-| S3 bucket `<name>-<account>-<region>` | inputs, sweep files, results; versioned; kept after `retire` unless `--delete-data` |
-| ECR repository `<name>-worker` | base and revision images; tags cannot be overwritten; kept after `retire` unless `--delete-data` |
-| Batch compute environment and queue | On-Demand EC2, minimum 0 vCPUs, maximum the cap |
-| Run job definition | the only container settings jobs can use: UID 1000, not privileged, no host mounts |
-| Agent role and profile | what day-to-day commands can do (see [How it works](how-it-works.md#permissions)) |
-| Guard Lambda, every 5 minutes | enforces the cutoff, stops stuck jobs, reports spend, checks the cost tag |
-| Control Lambda | cancels jobs in this queue; registers job definitions for new image digests |
-| AWS Budget `<name>-monthly` and two alarms | the alert emails, the cutoff trigger, and an email if the guard fails or stops running |
+| Versioned S3 bucket `<name>-<account>-<region>` | inputs, submissions, results |
+| ECR repository `<name>-worker` | base/revision images; immutable tags |
+| Batch compute environment, queue, job definition | On-Demand jobs; scales to zero after work ends |
+| Agent role | [routine command permissions](how-it-works.md#permissions) |
+| Guard Lambda | checks spend, cost tag and jobs every five minutes |
+| Control Lambda | queue cancellation and image-pinned job definitions |
+| Budget `<name>-monthly`, two health alarms | spending emails and guard failure/missing-invocation alerts |
 
-Nothing runs between jobs. With no work, what you pay for is storage (results, images, logs), the
-guard's invocations and the alarms. Check `cloudsweep status --storage` from time to time, and
-delete old results from the bucket when you no longer need them.
+The guard stops jobs observed in STARTING for over 30 minutes. It emails after three hours
+without job progress, or if capacity remains 30 minutes after work ends.
 
-## The budget counts only an active cost-allocation tag
+## Costs and limits
 
-Every resource is tagged `Project=<name>`, and the budget counts only costs with that tag. AWS
-Billing counts a tag only after the tag is *activated*, and it can be activated only after AWS has
-seen it on a bill, up to 24 hours after first use. Until then the budget, and so the cutoff, sees
-no spend. The vCPU cap and the per-run ceiling still limit spending in that period.
+You pay for On-Demand instances, storage (including disks, results, images and logs), data
+transfer, [public IPv4 addresses](https://aws.amazon.com/vpc/pricing/), guard invocations and
+alarms. Compute scales down after jobs finish; retained storage, the guard and alarms still
+cost money. Inspect storage with
+`cloudsweep status --storage`; the administrator can delete unneeded data.
 
-- **A standalone account**: deploy tries to activate the tag, and the guard tries again once a day
-  until it succeeds. No action is needed.
-- **A member account of an AWS Organization**: only the organization's management account can
-  activate tags. Ask whoever manages it to activate `Project` under Billing and Cost Management →
-  Cost allocation tags.
+`deploy` records current instance prices. `submit` prints an **estimate** (cheapest fitting
+instance × time limit) and **worst case** (most expensive deployed fitting instance × time limit).
+Both price a whole instance per command. Sharing or finishing early reduces cost; host-failure
+retries, startup, idle time and non-compute charges add to these figures. Neither is a bill cap.
 
-`cloudsweep status` and `cloudsweep doctor` show the tag's state as the guard last saw it.
+| Control | Default | Enforcement and gap |
+|---|---|---|
+| `--max-vcpus` | 32 | Batch cap; may exceed it by one instance |
+| `CLOUDSWEEP_MAX_RUN_USD` | $10 | local `submit` check against one command's worst case; excludes the additional costs above and does not limit the whole sweep |
+| `--cutoff` | $100/month | guard stops work at reported spend; billing lags usage by hours, so the bill can exceed it |
+| `--alerts A1,A2` | $50,$80 | monthly email alerts |
 
-## A tripped cutoff stays tripped until an administrator lifts it
+The budget counts gross costs tagged `Project=<name>`, without subtracting credits/refunds,
+and only after tag activation. **An inactive tag means the cutoff sees no spend.** Tags can take
+up to 24 hours to appear for activation, then up to another 24 hours to activate
+([AWS documentation](https://docs.aws.amazon.com/awsaccountbilling/latest/aboutv2/activating-tags.html)):
 
-When reported monthly spend reaches the cutoff, the guard immediately:
+- Standalone account: `deploy` tries to activate `Project`; the guard retries daily.
+- Organization member: ask the management account to activate `Project` in Billing → Cost
+  allocation tags.
 
-- records the cutoff in an SSM parameter;
-- attaches a policy to the agent role that denies job submission, uploads to the bucket and image
-  pushes (reading results and cancelling still work);
-- disables the queue and the compute environment;
-- stops every waiting and running job.
+`status` and `doctor` report the last observed tag state. The vCPU cap and local ceiling still
+apply while the tag is inactive.
 
-AWS emails you. To resume, check the actual spend, raise the cutoff if needed, then lift it:
+Administrators can edit the untracked `.cloudsweep/deploy.env`, which records deployment names,
+types, prices and local limits. Initially `CLOUDSWEEP_ENABLED=1` and `CLOUDSWEEP_MAX_RUN_USD=10`.
+`CLOUDSWEEP_ENABLED=0` blocks local `submit` and `image publish`; existing jobs continue until
+cancelled. These local controls are not AWS enforcement. If the ceiling blocks long runs,
+deploy without larger types or raise the local ceiling.
+
+## Reset a cutoff
 
 ```bash
-cloudsweep deploy --admin-profile admin --cutoff 200     # only if spend is still above the cutoff
+cloudsweep deploy --admin-profile admin --cutoff 200   # if a higher limit is needed
 cloudsweep admin reset-cutoff --admin-profile admin
 ```
 
-`deploy` never clears a cutoff. A new month does not clear it either.
+Check actual spending first. A tripped cutoff is recorded in SSM, denies the agent submissions,
+S3 uploads and image pushes, disables the queue and compute environment, and stops waiting/running
+jobs. Reading results and cancellation remain available. AWS emails you. Neither deployment nor
+a new month clears the cutoff; an administrator must reset it.
 
-The guard also stops jobs stuck in STARTING for more than 30 minutes. It emails you if jobs wait for
-three hours without progress, or if capacity has not returned to zero 30 minutes after work ended.
+## Identities
 
-## Two identities: assume-role (default) and roles-anywhere
+Both methods grant the same [agent permissions](how-it-works.md#permissions).
 
-The agent profile uses one of two methods to get credentials:
+- **assume-role** (default): uses the administrator profile's credentials, including SSO, to
+  assume the agent role. Those credentials must remain available on the machine.
+- **roles-anywhere**: uses an X.509 certificate without AWS keys on the submitting
+  machine. Deployment creates a private CA and one-year certificate, retains the certificate/key
+  under `~/.aws/rolesanywhere/<name>-agent/`, and installs the signing helper (x86_64 Linux only).
+  `status` warns within 30 days of expiry; rerun `deploy` to renew. Use
+  `--rotate-certificate` to renew earlier. The CA private key is not retained.
 
-- **assume-role** (default): the profile assumes the agent role using your administrator profile's
-  credentials, so it works only on a machine that also has those credentials. This works on any
-  operating system and with SSO profiles. It needs no maintenance.
-- **roles-anywhere**: the profile signs in with an X.509 certificate through IAM Roles Anywhere, so
-  the machine needs no AWS keys. Use it on a shared machine where your administrator credentials
-  should not be stored. `deploy` makes a private CA and a one-year certificate, keeps only the
-  certificate and its key (in `~/.aws/rolesanywhere/<name>-agent/`), and installs AWS's signing
-  helper (x86_64 Linux only). Rerun `deploy` within 30 days of expiry to renew it;
-  `cloudsweep status` warns you then.
+`CLOUDSWEEP_IDENTITY_DIR` and `CLOUDSWEEP_SIGNING_HELPER` override certificate and helper locations.
 
-Either way, the agent role can only do what [How it works](how-it-works.md#permissions) lists.
-
-## The flag and the ceiling are local settings
-
-`.cloudsweep/deploy.env` is yours to edit:
-
-- `CLOUDSWEEP_ENABLED=0` makes `submit` and `image publish` refuse new work on this machine.
-  Existing work keeps running; `cloudsweep cancel --all` stops it.
-- `CLOUDSWEEP_MAX_RUN_USD` is the most that one command may be estimated to cost.
-
-These limits are enforced by cloudsweep on the machine where it runs, not by AWS. The cap and the
-cutoff are enforced by AWS.
-
-## retire removes the deployment and keeps your results, unless you ask
+## retire
 
 ```bash
-cloudsweep admin retire --admin-profile admin --yes                 # keep results and images
-cloudsweep admin retire --admin-profile admin --yes --delete-data   # delete everything
+cloudsweep admin retire --admin-profile admin --yes
 ```
 
-This sets cloud use off, blocks submission, stops all jobs, waits until no instance is left (up to
-30 minutes), and deletes the stack and every job definition. It takes about ten minutes.
+Retirement disables local cloud use and submissions, stops jobs, waits up to 30 minutes for
+instances to disappear, then deletes the stack and job definitions. It usually takes about ten
+minutes. The bucket and image repository remain **billable**; the cutoff parameter, agent profile
+and local deployment settings also remain.
 
-Without `--delete-data`, the bucket and the image repository are kept, and you keep paying for
-their storage until you delete them. Also left in place: the cutoff parameter, the agent profile in
-`~/.aws/config`, and `.cloudsweep/deploy.env`.
+To remove retained data and settings:
 
-With `--delete-data`, retire then also deletes every object version in the bucket and the bucket
-itself, the image repository, the cutoff parameter, the agent profile and certificate, and
-`.cloudsweep/deploy.env`. **The results in the bucket cannot be recovered**, so fetch what you need
-first. Receipts and acceptance results in `.cloudsweep/` and local container images stay. If it
-stops partway, run the same command again: it continues from where it stopped.
+```bash
+cloudsweep admin retire --admin-profile admin --yes --delete-data
+```
 
-## Using one deployment from another machine
+**This cannot be undone. Fetch needed results first.** It deletes every bucket object version,
+the bucket, image repository, cutoff parameter, agent profile/certificate and `deploy.env`.
+Local receipts, acceptance results and container images remain. If retirement stops partway,
+rerun the same command to continue.
 
-The deployment's settings are files on the machine where you ran `deploy`. To use the deployment
-from a second machine, run `deploy` there too, with the same admin profile and `--prefix`. The rerun
-changes nothing in AWS and writes the local files. With roles-anywhere, the rerun issues a new
-certificate if the second machine has none, and that makes the first machine's certificate
-invalid. Use assume-role if both machines have administrator credentials.
+## Another machine
+
+Rerun `deploy` there with the same administrator profile, `--prefix` and `--region` to write local
+settings and reconcile the stack. With roles-anywhere, issuing a certificate on the second
+machine invalidates the first machine's certificate. Use assume-role when both have administrator
+credentials. `CLOUDSWEEP_ENV` selects an existing `deploy.env` from another directory.

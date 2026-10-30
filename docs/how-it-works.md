@@ -1,118 +1,88 @@
 # How it works
 
-## One submission, from commit to verified files
+## Submission lifecycle
 
-```
-your machine                                   AWS
-────────────                                   ───
+```text
+your machine                                  AWS
 submit
- ├ checks: committed? enabled? cutoff clear?
- │   fits an instance? under the cap and ceiling?
- ├ revision image for (commit, base, recipe) ──▶ ECR   (built and pushed once per commit)
- ├ job definition pinned to the image digest ──▶ control Lambda copies the stack's template
- ├ inputs by SHA-256, sweep, submission.json ──▶ S3 inputs/, submissions/<id>/
- ├ receipt written locally, then
- └ SubmitJob (array of N children) ───────────▶ Batch queue ─▶ EC2 instances (0 → cap)
-                                                  each child, in a fresh container:
-                                                   1 verify image digest, commit, binary hash
-                                                   2 place inputs, check their hashes
-                                                   3 run its command, in its own process group
-                                                   4 upload {out}, stdout, stderr ─▶ S3 runs/<id>/<child>/<attempt>/
-                                                   5 upload manifest.json last
-fetch ◀──────────────────────────────────────── S3
- └ checks every file's size and SHA-256 against the manifest, and the provenance of each success
+ ├ admission checks
+ ├ revision image ──────────────────────────▶ ECR
+ ├ image digest ────────────────────────────▶ control Lambda → job definition
+ ├ inputs, commands, submission manifest ────▶ S3
+ ├ local receipt
+ └ SubmitJob ───────────────────────────────▶ Batch queue → EC2
+                                               one container per command:
+                                                1 verify build and inputs
+                                                2 run command in its own process group
+                                                3 upload outputs, stdout, stderr
+                                                4 upload manifest.json last
+fetch ◀───────────────────────────────────── S3 runs/<id>/<child>/<attempt>/
+ └ verify downloaded files and report completion
 ```
 
-The worker is one Python file using only the standard library, plus a small S3 client. AWS
-signature version 4 is implemented with `hmac` and `hashlib`, and credentials come from the ECS
-task-role endpoint that Batch provides. This is why your image needs only `python3` and `git`.
+See [Running work](running.md) for commands and [Administration](admin.md#costs-and-limits) for
+admission controls and their gaps.
 
-## What is verified, and what is not
+## Revision images
+
+A revision image is keyed by the commit, base image digest and build recipe. `submit` reuses a
+published match; otherwise it builds and pushes one from the newest published base.
+
+The build starts with a shallow clean checkout at `/work/src`, including `.git` but no local
+uncommitted or untracked files. It runs the committed build command as root and records the
+commit, binary hash and tracked-file state. Programs can use `git rev-parse HEAD` in the checkout.
+See [project configuration](project.md#configuration) for the recipe.
+
+## Verification
 
 | Check | Where |
 |---|---|
-| The source is a commit, not a working tree with edits | `submit`, `try` |
-| The image the job runs is the one submitted (digest) | worker, before running |
-| The checkout is that commit, and its tracked files (content and modes) are as built | worker, before running |
-| The binary has the SHA-256 recorded when it was built | worker, before running |
-| Every input has the SHA-256 recorded at submission | worker, after download |
-| Every output file has the size and SHA-256 that the worker recorded | `fetch` |
-| A success names the submitted commit and image digest (the digest fixes the binary) | `fetch` |
-| A new base image reproduces a known result (if configured) | `image build`, `image publish` |
+| Committed source; no tracked working-tree edits | `submit`, `try` |
+| Submitted image digest and commit match the build; tracked contents/modes and binary hash match the build record | worker, before execution |
+| Downloaded input hashes match the submission | worker |
+| File sizes/hashes match the attempt manifest; successful attempts name the submitted commit/image and valid binary provenance | `fetch` |
+| Known output reproduced, when acceptance is configured | `image build`, `image publish` |
 
-The hashes show that the files you hold are the files that were produced, by that commit in that
-image. They do not show that the program is correct. They also do not show that two different
-images give the same results, unless you configure an acceptance run.
+Hashes check file integrity and recorded provenance; they do not prove program correctness.
+An [acceptance run](project.md#acceptance-runs) checks one known result across image changes,
+not equivalence for every input. Programs exit 0 to succeed; results count only when
+[`fetch` reports `complete`](running.md#fetch).
 
-Host details are recorded with each attempt in `started.json`: kernel, CPU model, online CPUs,
-cgroup limits. Use them when you compare timings across runs.
+Each attempt records the kernel, CPU model, online CPUs and cgroup limits in `started.json`
+for timing comparisons. Images and manifests are trusted code/data, not independent attestations.
 
-## Retries never overwrite evidence
+## Retries
 
-The job definition retries a command once if its host failed, and never retries for any other
-reason. Each attempt writes to its own directory. If a directory with the same attempt number
-already has objects in it, the worker uses a suffixed name (`1-2`) instead of overwriting.
-`manifest.json` is written last, so an attempt without one is known to be incomplete.
+Batch retries once for a host failure, not other failures. Each attempt has its own directory.
+If its number is already present, the worker adds a suffix (`1-2`). The final manifest is uploaded
+last; without it an attempt is incomplete. See [submission receipts](running.md#submit) before
+manually retrying an uncertain submission.
 
 ## Permissions
 
-Day-to-day commands use the agent role. It can:
+The agent role can:
 
-- submit jobs to this deployment's queue, using this deployment's job definition;
-- read and write this deployment's bucket, except that it cannot delete objects or write under
-  `runs/` (only jobs write results);
-- push and pull images in this deployment's repository;
-- read Batch state, this deployment's job logs, and the cutoff parameter;
+- submit to this queue using this deployment's job definitions;
+- read the bucket and upload to `inputs/` and `submissions/`, but not delete objects or write results;
+- push/pull repository images and read their sizes;
+- read Batch state, deployment job logs and cutoff state;
 - invoke the control Lambda.
 
-Batch's read actions (DescribeJobs, ListJobs, DescribeJobDefinitions, ...) cannot be limited to one
-queue, so the agent can also *read* other Batch jobs and job definitions in the same account, in
-any region, including their environment variables. Do not deploy into an account whose other Batch
-workloads keep secrets in environment variables, or use a separate account.
+**Batch reads are account-wide, across regions**, including other jobs' and job definitions'
+environment variables. These read permissions cannot be scoped to the queue. Use a separate
+account if other Batch workloads store secrets in environment variables.
 
-It cannot register job definitions, pass IAM roles, change the budget, the cap or the cutoff,
-terminate jobs directly, or change anything outside the deployment. A job definition is registered
-only by the control Lambda. The Lambda copies the stack's own template and changes nothing except
-the image digest, which must be in this deployment's repository. A job therefore always runs as UID
-1000, unprivileged, without host mounts, with the stack's roles.
+The agent cannot register job definitions, pass IAM roles, modify IAM or AWS spending limits,
+clear the cutoff, terminate jobs directly, or change resources outside the deployment.
+The control Lambda cancels only this queue's jobs. For new images it copies the stack's job
+template, changing only the image digest to one in this repository: UID 1000, unprivileged,
+no host mounts, and the stack's roles.
 
-Jobs run with a role that can read `inputs/` and `submissions/` and write `runs/`. On the
-instances, a firewall rule stops non-root processes from reaching the EC2 instance metadata
-service, so a job cannot use the instance's credentials. This rule is defense in depth, not
-isolation. Treat your images as trusted code: a process that becomes root inside the container
-could reach that service.
+Jobs obtain task-role credentials from the ECS endpoint. Their shared role reads **all**
+`inputs/` and `submissions/` and writes anywhere under `runs/` in this deployment's bucket.
+There is no per-job S3 isolation; a job could overwrite another job's results. Bucket versioning
+preserves versions, but does not prevent those writes.
 
-## Cost controls and their gaps
-
-- **The vCPU cap** is a Batch setting. With the default allocation strategy, Batch may go over the
-  cap by one instance.
-- **The per-run ceiling** is checked by `submit` on your machine, against the worst case: the most
-  expensive deployed instance type that fits the command, at the price that `deploy` read.
-- **The cutoff** acts on AWS Budgets' *reported* spend, which is hours behind real usage. Spending
-  between the last report and the cutoff is not prevented. The budget counts only costs tagged
-  `Project=<name>`, and only once that tag is active (see
-  [Administration](admin.md#the-budget-counts-only-an-active-cost-allocation-tag)). It counts gross
-  costs: credits and refunds are not subtracted.
-- **When the cutoff trips**, the agent role is denied job submission, uploads to the bucket and
-  image pushes. It can still read results and cancel. Storage already kept goes on costing until
-  you delete it.
-- **The guard** emails you if it fails or stops running. It runs as a Lambda with one reserved
-  concurrent execution.
-
-## Files and settings
-
-| Where | What |
-|---|---|
-| `cloudsweep.ini` (committed) | build recipe, image, run defaults, acceptance |
-| `.cloudsweep/deploy.env` (untracked) | the deployment's names, instance types and prices, and your two local limits |
-| `.cloudsweep/receipts/` | one JSON file per submission |
-| `.cloudsweep/acceptance/` | acceptance results, by base image ID |
-| `~/.aws/config` | the `<name>-agent` profile |
-
-| Environment variable | Effect |
-|---|---|
-| `CLOUDSWEEP_ADMIN_PROFILE` | administrator profile for `deploy` and `admin` |
-| `CLOUDSWEEP_ENV` | path of `deploy.env`, to use a deployment from another directory |
-| `CLOUDSWEEP_ENGINE` | `docker` or `podman` (default: Podman if installed) |
-| `CLOUDSWEEP_PODMAN_ROOT` | Podman storage on local disk, for network home directories |
-| `CLOUDSWEEP_IDENTITY_DIR`, `CLOUDSWEEP_SIGNING_HELPER` | roles-anywhere certificate and helper locations |
+Trust your images and submitted programs. A firewall blocks non-root access to EC2 instance
+metadata; a process that becomes root inside the container could reach it. This is defense in
+depth, not isolation. See [Security](../SECURITY.md) for reporting problems.

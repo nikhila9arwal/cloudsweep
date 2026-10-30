@@ -746,15 +746,14 @@ def locked(action, args):
 def add_arguments(commands):
     up = commands.add_parser(
         "deploy", help="(administrator) create or update the AWS stack",
-        description="Create or update the AWS resources: bucket, image registry, Batch queue that scales to "
-                    "zero, budget alerts and cutoff, and the agent profile. Rerun it to change settings; "
-                    "omitted options keep their current values.")
+        description="Create or update billable AWS resources and the agent profile. "
+                    "Reruns preserve omitted settings. See docs/admin.md for costs and limits.")
     up.add_argument("--admin-profile", help="administrator AWS CLI profile (default: $CLOUDSWEEP_ADMIN_PROFILE or default)")
-    up.add_argument("--region", help="AWS region (default: the admin profile's region, else us-east-1)")
-    up.add_argument("--prefix", help="deployment name (default: [project] name in cloudsweep.ini)")
+    up.add_argument("--region", help="region (default: recorded for this deployment, else admin profile's, else us-east-1)")
+    up.add_argument("--prefix", help="deployment name (default: recorded name, else [project] name)")
     up.add_argument("--email", help="address for budget alerts and guard warnings (required the first time)")
     up.add_argument("--instance-types", help="comma-separated EC2 types (default %s)" % DEFAULT_TYPES)
-    up.add_argument("--max-vcpus", type=int, help="cap on running vCPUs (default %s)" % DEFAULTS["MaxvCpus"])
+    up.add_argument("--max-vcpus", type=int, help="vCPU cap; Batch may exceed it by one instance (default %s)" % DEFAULTS["MaxvCpus"])
     up.add_argument("--alerts", type=lambda text: text.split(","), metavar="A1,A2",
                     help="monthly email alert amounts in USD (default %s,%s)" % (DEFAULTS["AlertAmount1"], DEFAULTS["AlertAmount2"]))
     up.add_argument("--cutoff", help="monthly reported spend in USD that stops all work (default %s)" % DEFAULTS["CutoffAmount"])
@@ -766,7 +765,7 @@ def add_arguments(commands):
     up.add_argument("--price", action="append", metavar="TYPE=USD",
                     help="On-Demand USD per hour for a type, when the Price List API cannot be read")
     up.add_argument("--rotate-certificate", action="store_true",
-                    help="(roles-anywhere) issue a new agent certificate even with more than 30 days left")
+                    help="(roles-anywhere) force a new agent certificate")
     up.set_defaults(handler=lambda args: locked(deploy, args))
 
     group = commands.add_parser("admin", help="(administrator) reset the budget cutoff or remove the stack")
@@ -777,14 +776,14 @@ def add_arguments(commands):
     reset.add_argument("--admin-profile")
     reset.set_defaults(handler=lambda args: locked(reset_cutoff, args))
     gone = actions.add_parser("retire", help="stop all work and delete the stack (bucket and images are kept)",
-                              description="Stop all work, wait for the instances to go, and delete the stack and "
-                                          "job definitions. The bucket, image repository, cutoff parameter, agent "
-                                          "profile and deploy.env are kept unless you add --delete-data.")
+                              description="Stop jobs, wait for instances to terminate, then delete the stack and "
+                                          "job definitions. Retained storage remains billable. "
+                                          "See docs/admin.md for retained resources and cleanup.")
     gone.add_argument("--admin-profile")
     gone.add_argument("--yes", action="store_true", help="confirm")
     gone.add_argument("--delete-data", action="store_true",
-                      help="also delete the bucket with every result in it, the image repository, the cutoff "
-                           "parameter, the agent profile and certificate, and deploy.env")
+                      help="permanently delete all bucket versions, images and deployment settings; "
+                           "cannot be undone. Fetch needed results first")
     gone.set_defaults(handler=lambda args: locked(retire, args))
 
 
