@@ -37,13 +37,24 @@ def checks(config, image):
             raise Refusal("the toolchain check failed: %s" % config["check"])
 
 
+def located(spec, repo, main):
+    """An [acceptance] input relative to the checkout or, when a linked worktree lacks the file
+    (inputs are often untracked), to the main checkout."""
+    path, sep, name = spec.partition("=")
+    if not Path(path).is_absolute():
+        places = [Path(repo) / path, Path(main) / path]
+        path = str(next((place for place in places if place.is_file()), places[0]))
+    return path + sep + name
+
+
 def accept(repo, name, image, image_id, revision, keep=None):
     """Run the [acceptance] command through the worker on the new base and its host check."""
     config = project.load(repo)
     spec = project.acceptance(config)
     commit = settings.clean_commit(repo, revision)
     recipe = project.recipe(project.load(repo, commit))
-    files = submit.input_files(spec["inputs"], [repo.resolve()])
+    main = project.main_checkout(repo).resolve()
+    files = submit.input_files([located(text, repo, main) for text in spec["inputs"]], [repo.resolve(), main])
     try:
         commands = [core.check_command(spec["command"], set(files), recipe["binary"] is not None)]
     except ValueError as error:

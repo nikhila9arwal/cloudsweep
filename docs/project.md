@@ -77,8 +77,9 @@ run and the check must succeed; `image publish` requires a passing result for th
 Without `[acceptance]`, publication requires only the worker and toolchain checks.
 
 Use a deterministic run lasting seconds to a minute. `cmp` against a committed reference is
-sufficient; use a script to ignore variable fields such as timings. Acceptance results are stored
-under `.cloudsweep/acceptance/`, keyed by base image ID.
+sufficient; use a script to ignore variable fields such as timings. Relative `inputs` paths are
+read from the checkout; in a linked worktree, a file missing there is read from the main checkout.
+Acceptance results are stored under `.cloudsweep/acceptance/`, keyed by base image ID.
 
 ## Local container settings
 

@@ -14,7 +14,7 @@ from unittest import mock
 
 from helpers import PACKAGE, TYPES, git, make_repo
 
-from cloudsweep import admin, cli, project, settings, submit
+from cloudsweep import admin, cli, image, project, settings, submit
 
 try:
     import yaml
@@ -176,6 +176,18 @@ class SubmitTests(unittest.TestCase):
         git(self.repo, "worktree", "add", "--quiet", "--detach", str(worktree))
         self.assertEqual(settings.settings_path(worktree), self.repo / ".cloudsweep/deploy.env")
 
+    def test_acceptance_inputs_a_worktree_lacks_come_from_the_main_checkout(self):
+        worktree = self.root / "wt"
+        git(self.repo, "worktree", "add", "--quiet", "--detach", str(worktree))
+        (self.repo / "fixtures").mkdir()
+        (self.repo / "fixtures/untracked.txt").write_text("x")
+        (worktree / "local.txt").write_text("y")
+        main = project.main_checkout(worktree)
+        self.assertEqual(image.located("fixtures/untracked.txt", worktree, main), str(main / "fixtures/untracked.txt"))
+        self.assertEqual(image.located("local.txt=named", worktree, main), str(worktree / "local.txt") + "=named")
+        files = submit.input_files([image.located("fixtures/untracked.txt", worktree, main)], [worktree, main])
+        self.assertEqual(list(files), ["fixtures/untracked.txt"])
+
 
 REAL_ADMIT = settings.admit
 
@@ -248,6 +260,26 @@ class DeployArgumentTests(unittest.TestCase):
     def test_a_latched_cutoff_keeps_the_queue_disabled(self):
         parameters = admin.parameters_from(self.args(), {}, "k", {"cutoff_active": True})
         self.assertEqual(parameters["QueueState"], "DISABLED")
+
+    def test_an_older_stack_keeps_its_sign_in_and_instance_types(self):
+        calls = []
+        def aws(*args, **kwargs):
+            calls.append(args)
+            return {"computeEnvironments": [{"computeResources": {"instanceTypes": ["r8a.large", "r8a.xlarge"]}}]}
+        old = {"MaxvCpus": "16", "CaCertificate": "-----BEGIN CERTIFICATE-----", "GuardCodeKey": "k"}
+        with mock.patch.object(admin, "say"):
+            previous = admin.carried_over(aws, "demo", old)
+        parameters = admin.parameters_from(self.args(), previous, "k", "absent")
+        self.assertEqual((parameters["Identity"], parameters["InstanceTypes"]), ("roles-anywhere", "r8a.large,r8a.xlarge"))
+        self.assertEqual(calls[0][:4], ("batch", "describe-compute-environments", "--compute-environments", "demo-cpu"))
+        # Flags still win, and stacks that record both settings, or no stack at all, are left alone.
+        given = admin.parameters_from(self.args(identity="assume-role"), previous, "k", "absent")
+        self.assertEqual(given["Identity"], "assume-role")
+        current = dict(old, Identity="assume-role", InstanceTypes="m7a.large")
+        calls.clear()
+        self.assertEqual(admin.carried_over(aws, "demo", current), current)
+        self.assertEqual(admin.carried_over(aws, "demo", {}), {})
+        self.assertEqual(calls, [])
 
     def test_low_lambda_concurrency_is_refused_before_anything_is_created(self):
         def aws(*args, **kwargs):

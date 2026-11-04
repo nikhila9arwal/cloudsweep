@@ -244,6 +244,23 @@ def queue_state(latch):
     return "DISABLED" if isinstance(latch, dict) and latch["cutoff_active"] else "ENABLED"
 
 
+def carried_over(aws, prefix, previous):
+    """A stack from before the Identity and InstanceTypes parameters keeps its own settings on
+    upgrade: the certificate sign-in when it trusts a CA, and its compute environment's types."""
+    previous = dict(previous)
+    if previous and "Identity" not in previous:
+        previous["Identity"] = "assume-role" if previous.get("CaCertificate", "none") == "none" else "roles-anywhere"
+        say("this stack predates the identity setting; keeping %s" % previous["Identity"])
+    if previous and "InstanceTypes" not in previous:
+        environments = aws("batch", "describe-compute-environments", "--compute-environments",
+                           prefix + "-cpu")["computeEnvironments"]
+        types = environments[0]["computeResources"]["instanceTypes"] if environments else []
+        if types:
+            previous["InstanceTypes"] = ",".join(types)
+            say("this stack predates the instance-type setting; keeping %s" % previous["InstanceTypes"])
+    return previous
+
+
 def parameters_from(args, previous, guard_key, latch):
     given = {"Prefix": args.prefix}
     for key, value in (("VpcId", args.vpc), ("Subnets", args.subnets), ("AlertEmail", args.email),
@@ -429,6 +446,7 @@ def deploy(args):
                     or current["status"] in ("ROLLBACK_COMPLETE", "DELETE_COMPLETE")):
         die("existing stack %s is %s and needs inspection in the CloudFormation console" % (stack, current["status"]))
     previous = current["parameters"] if current and "GuardCodeKey" in current["parameters"] else {}
+    previous = carried_over(aws, prefix, previous)
     if not previous and queue_state(latch) == "DISABLED":
         die("a cutoff latch from an earlier deployment is set; inspect /%s/cloud/cutoff first" % prefix)
     if not previous:
