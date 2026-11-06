@@ -117,9 +117,10 @@ itself, with its own podman or Docker.
 
 On the machine, the revision is built inside the image (on a cluster's login node) with the
 checkout at `/work/src`, as on AWS, and each command runs with `apptainer exec`: its copy of the
-checkout at `/work`, the store at `/store`, and the machine's GPUs (`--nv`) for GPU commands. The
-machine needs Apptainer (or Singularity), on a cluster's compute nodes too. If your home directory
-is on a network filesystem, set `CLOUDSWEEP_PODMAN_ROOT` to a local directory.
+checkout at `/work/src` (`/work` is its home directory), the store at `/store`, and the machine's GPUs
+(`--nv`) for GPU commands. The machine needs Apptainer (or Singularity), on a cluster's compute nodes
+too. If your home directory here is on a network filesystem, set `CLOUDSWEEP_PODMAN_ROOT` to a local
+directory for this host's podman; a machine that builds the image uses its own temporary directory.
 
 ## What happens
 

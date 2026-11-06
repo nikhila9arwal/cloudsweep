@@ -18,10 +18,11 @@ cloudsweep fetch <submission> --wait                          # verified results
 You need Python 3.9+, Git and rsync. `--on local` needs Linux; from macOS you can run on other
 machines and AWS. Each machine you run on needs bash, git, rsync and Python 3.6+.
 
-To run commands on a machine in your toolchain image instead (`container = apptainer`), you also
-need Podman or Docker here, Apptainer on the machine, and preferably Apptainer here too. For a machine
-of another architecture, such as aarch64 DeltaAI from an x86 host, you need QEMU emulation here
-(`sudo apt install qemu-user-static`).
+To run commands on a machine in your toolchain image instead (`container = apptainer`), the machine
+needs Apptainer. The image is built here when you have Podman or Docker (with QEMU emulation for a
+machine of another architecture, such as aarch64 DeltaAI from an x86 host:
+`sudo apt install qemu-user-static`), and converted here when you also have Apptainer; otherwise the
+machine converts or builds it.
 
 ```bash
 git clone https://github.com/nikhila9arwal/cloudsweep

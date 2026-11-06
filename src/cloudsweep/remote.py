@@ -139,17 +139,18 @@ def image_path(site):
     return site.root / "images" / site.job["container"]["key"] / "base.sif"
 
 
-def in_container(site, binds, env, image=None):
-    """The image's worker under apptainer exec, as Batch runs it: only these variables, these
-    directories bound in, and the host's GPUs (--nv) for GPU commands."""
-    argv = [apptainer(), "exec", "--cleanenv", "--no-home"]
-    for source, target in binds:
-        argv += ["--bind", "%s:%s" % (source, target)]
+def in_container(site, work, env, store=False):
+    """The image's worker under apptainer exec, as Batch runs it: only these variables, work as
+    /work and the home directory (apptainer sets HOME itself), the store at /store, and the host's
+    GPUs (--nv) for GPU commands."""
+    argv = [apptainer(), "exec", "--cleanenv", "--home", "%s:/work" % work]
+    if store:
+        argv += ["--bind", "%s:/store" % site.store]
     if site.job["gpus"]:
         argv.append("--nv")
     for name, value in sorted(env.items()):
         argv += ["--env", "%s=%s" % (name, value)]
-    return argv + [str(image or image_path(site)), "python3", "/opt/cloudsweep/worker.py"]
+    return argv + [str(image_path(site)), "python3", "/opt/cloudsweep/worker.py"]
 
 
 def stream(argv, log, **kwargs):
@@ -226,13 +227,12 @@ def build(site):
     log = site.build / "build.log"
     print("cloudsweep: building %s here (once per commit and setup); log %s" % (site.job["commit"][:12], log),
           file=sys.stderr, flush=True)
-    if site.job.get("container"):
-        argv = in_container(site, [(site.build, "/work")], {"HOME": "/work", "GIT_OPTIONAL_LOCKS": "0"}) + \
-            ["build", "--keep-modes"]
-    else:
-        argv = [sys.executable, "-c", "import sys; sys.path.insert(0, %r); import worker; "
-                "sys.exit(worker.build_mode(%r, writable=False))" % (str(HERE), str(site.build))]
     try:
+        if site.job.get("container"):
+            argv = in_container(site, site.build, {"GIT_OPTIONAL_LOCKS": "0"}) + ["build", "--keep-modes"]
+        else:
+            argv = [sys.executable, "-c", "import sys; sys.path.insert(0, %r); import worker; "
+                    "sys.exit(worker.build_mode(%r, writable=False))" % (str(HERE), str(site.build))]
         with open(str(log), "wb") as stream_:
             process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(site.build),
@@ -361,6 +361,7 @@ def submit(site):
     """Build if needed, then start the work, unless the submission was cancelled meanwhile."""
     result = {}
     if site.job.get("container"):
+        apptainer()  # before taking any lock up
         result["image"] = ensure_image(site)
     result["built"] = build(site)
     if site.cancelled():
@@ -402,14 +403,22 @@ def child(site, index=None):
         if not site.job.get("container"):
             os.environ.update(env, CLOUDSWEEP_WORK=str(scratch), CLOUDSWEEP_STORE="file://" + str(site.store))
             return worker.main(["run", site.submission])
-        env.update(CLOUDSWEEP_STORE="file:///store", HOME="/work")
+        env.update(CLOUDSWEEP_STORE="file:///store")
         env.update({name: os.environ[name] for name in ("CLOUDSWEEP_TIME_LIMIT", "CUDA_VISIBLE_DEVICES")
                     if name in os.environ})
-        process = subprocess.Popen(in_container(site, [(scratch, "/work"), (site.store, "/store")], env) +
-                                   ["run", site.submission], stdin=subprocess.DEVNULL)
-        for signum in (signal.SIGTERM, signal.SIGINT):  # apptainer passes them to the worker
-            signal.signal(signum, lambda signum, frame: process.send_signal(signal.SIGTERM))
-        return process.wait()
+        started, stops = [], []
+
+        def forward(signum, frame):  # apptainer passes it to the worker, which uploads what it has
+            stops.append(signum)
+            for process in started:
+                process.send_signal(signal.SIGTERM)
+        for signum in (signal.SIGTERM, signal.SIGINT):
+            signal.signal(signum, forward)
+        started.append(subprocess.Popen(in_container(site, scratch, env, store=True) + ["run", site.submission],
+                                        stdin=subprocess.DEVNULL))
+        if stops:  # it came while the container started
+            started[0].send_signal(signal.SIGTERM)
+        return started[0].wait()
     finally:
         shutil.rmtree(str(scratch), ignore_errors=True)
 

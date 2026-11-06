@@ -356,9 +356,9 @@ index, binds, env, clean = 1, {{}}, {{}}, False
 while args[index].startswith("--"):
     flag = args[index]
     index += 1
-    if flag in ("--bind", "--env"):
-        key, value = args[index].split(":" if flag == "--bind" else "=", 1)
-        (binds.__setitem__(value, key) if flag == "--bind" else env.__setitem__(key, value))
+    if flag in ("--bind", "--home", "--env"):
+        key, value = args[index].split("=" if flag == "--env" else ":", 1)
+        (env.__setitem__(key, value) if flag == "--env" else binds.__setitem__(value, key))
         index += 1
     clean = clean or flag == "--cleanenv"
 with open(os.environ["FAKE_LOG"], "a") as log:
@@ -398,8 +398,9 @@ class ContainerTests(MachineFixture):
             stream.write("\n[ctr]\nkind = slurm\nhost = fakehost\nworkdir = %s/ctr\ncontainer = apptainer\n" % self.root)
 
     def built_here(self):
-        def save(*args, **kwargs):
-            Path(args[list(args).index("-o") + 1]).write_text("archive")
+        def save(*args, **kwargs):  # engine.engine: tag does nothing here, save writes the archive
+            if "-o" in args:
+                Path(args[list(args).index("-o") + 1]).write_text("archive")
         return [mock.patch.object(machines, "builds_here", return_value=True),
                 mock.patch.object(machines.engine, "build_base", return_value="sha256:" + "c" * 64),
                 mock.patch.object(machines.engine, "engine_name", return_value="podman"),
@@ -424,6 +425,9 @@ class ContainerTests(MachineFixture):
     def test_the_image_is_built_and_converted_here(self):
         job, images, log = self.run_sweep(self.built_here())
         self.assertEqual(job["container"]["key"], "c" * 16)
+        code, out = self.cli("submit", "--on", "ctr", "--dry-run", "--commands", str(self.sweep), "--input",
+                             "trace.bin")
+        self.assertIn("the image is built when you submit", out)  # a dry run builds nothing
         self.assertTrue((images / "base.sif").is_file())
         self.assertFalse((images / "base.tar").exists())
         self.assertNotIn("podman", log)

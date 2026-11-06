@@ -150,12 +150,17 @@ def builds_here(target):
     architecture, or emulation for the other (QEMU's binfmt entry on Linux; Docker Desktop and
     podman machine provide it elsewhere)."""
     try:
-        engine.engine_name()
-    except Refusal:
+        working = engine.engine("info", stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
+    except (Refusal, OSError):
         return False
-    if platform.system() != "Linux":
+    if working.returncode:
+        return False
+    if platform.system() != "Linux" or target == PLATFORM_OF.get(platform.machine()):
         return True
-    return target == PLATFORM_OF.get(platform.machine()) or Path("/proc/sys/fs/binfmt_misc", QEMU[target]).exists()
+    try:
+        return Path("/proc/sys/fs/binfmt_misc", QEMU[target]).read_text().startswith("enabled")
+    except OSError:
+        return False
 
 
 def prepare_image(repo, target):
@@ -171,13 +176,21 @@ def prepare_image(repo, target):
               % target, file=sys.stderr, flush=True)
         image_id = engine.build_base(spec, name, tag)
         images.checks(spec, tag)
-        return {"key": image_id.split(":", 1)[1][:16], "tag": tag, "spec": spec}
+        key = image_id.split(":", 1)[1][:16]
+        exact = "localhost/cloudsweep-image:%s" % key  # a concurrent build may move tag; this names the image
+        engine.engine("tag", image_id, exact)
+        return {"key": key, "tag": exact, "spec": spec}
     digest = hashlib.sha256(json.dumps([target, engine.WORKER_LAYER, spec["check"]]).encode())
-    for path in [spec["dockerfile"]] + sorted(Path(spec["context"]).rglob("*")) + \
+    for path in [spec["dockerfile"]] + context_files(spec["context"]) + \
             [engine.HERE / file for file in engine.WORKER_FILES]:
-        if Path(path).is_file():
-            digest.update(str(path).encode() + b"\0" + Path(path).read_bytes())
+        digest.update(b"%s\0%o\0" % (str(path).encode(), Path(path).stat().st_mode) + Path(path).read_bytes())
     return {"key": digest.hexdigest()[:16], "tag": None, "spec": spec}
+
+
+def context_files(context):
+    """The Docker build context's files, without the directories Git and cloudsweep keep there."""
+    return [path for path in sorted(Path(context).rglob("*")) if path.is_file() and
+            not {".git", ".cloudsweep"} & set(path.relative_to(context).parts)]
 
 
 def stage_image(tree, image):
@@ -186,7 +199,8 @@ def stage_image(tree, image):
     directory = tree / "images" / image["key"]
     directory.mkdir(parents=True)
     if image["tag"] is None:
-        shutil.copytree(str(image["spec"]["context"]), str(directory / "context"), symlinks=True)
+        shutil.copytree(str(image["spec"]["context"]), str(directory / "context"), symlinks=True,
+                        ignore=shutil.ignore_patterns(".git", ".cloudsweep"))
         shutil.copy2(str(image["spec"]["dockerfile"]), str(directory / "Dockerfile"))
         (directory / "worker").mkdir()
         for file in engine.WORKER_FILES:
@@ -312,7 +326,7 @@ def submit(args, prepare):
         if machine["kind"] == "ssh" and gpus and machine["gpus"] == 0:
             raise Refusal("these commands need GPUs; [%s] sets gpus = 0" % machine["name"])
         image = None
-        if machine["container"]:
+        if machine["container"] and not args.dry_run:
             arch = ssh(machine, "uname -m").stdout.split()
             target = PLATFORM_OF.get(arch[-1] if arch else "")
             if not target:
@@ -336,6 +350,8 @@ def submit(args, prepare):
                 "host": machine["host"], "workdir": workdir, "commit": commit, "children": len(commands),
                 "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus, "hours": str(hours), "build": build,
                 "image_digest": digest}
+        if machine["container"] and not image:
+            plan["container"] = "apptainer; the image is built when you submit"
         if image:
             plan["container"] = "apptainer, image %s built %s" % (image["key"], "here" if image["tag"] else
                                                                   "on the machine (this host cannot build for it)")
