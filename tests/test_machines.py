@@ -496,7 +496,7 @@ class ContainerTests(MachineFixture):
     def test_an_image_replaced_after_its_submission_is_refused(self):
         self.given_image()
         found = machines.existing_image
-        with mock.patch.object(machines, "existing_image", lambda machine: dict(found(machine), stamp="1:0.0")):
+        with mock.patch.object(machines, "existing_image", lambda machine: dict(found(machine), stamp="1:0")):
             _, out = self.submit("given", expect=1)  # as if the file had another size and time at submission
         self.assertIn("changed after this submission", out)
         submission, _ = self.submit("given")

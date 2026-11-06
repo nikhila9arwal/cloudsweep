@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 (2026-11-06)
+
+- An image already on a machine (`container = PATH.sif`) is identified with the machine's Python
+  rather than `stat`, whose output differs between coreutils implementations: 0.2.0 refused every
+  such image on a machine with Rust coreutils, such as Ubuntu 26.04.
+
 ## 0.2.0 (2026-11-06)
 
 - **Changed:** without `--on`, `submit`, `status`, `cancel`, `fetch` and `doctor` use this host

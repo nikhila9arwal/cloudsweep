@@ -136,9 +136,9 @@ def apptainer():
 
 
 def image_stamp(path):
-    """An image file's size and modification time, as `stat -c %s:%.9Y` prints them."""
+    """An image file's size and modification time in nanoseconds, as machines.STAMP reads them."""
     status = os.stat(str(path))
-    return "%d:%d.%09d" % ((status.st_size,) + divmod(status.st_mtime_ns, 10 ** 9))
+    return "%d:%d" % (status.st_size, status.st_mtime_ns)
 
 
 def image_changed(site):

@@ -55,6 +55,9 @@ MISSING_CODE = 97  # remote exit status: this version of cloudsweep's code is no
 ACTIVE = ("PENDING", "RUNNING")
 PLATFORM_OF = {"x86_64": "linux/amd64", "amd64": "linux/amd64", "aarch64": "linux/arm64", "arm64": "linux/arm64"}
 QEMU = {"linux/amd64": "qemu-x86_64", "linux/arm64": "qemu-aarch64"}  # binfmt_misc entries for emulated builds
+# An image file's size and modification time in nanoseconds, as remote.image_stamp gives them; read
+# with the machine's Python, since stat's formats differ between coreutils implementations.
+STAMP = "import os, sys; s = os.stat(os.path.expanduser(sys.argv[1])); print('%d:%d' % (s.st_size, s.st_mtime_ns))"
 SIGNAL_SECONDS = 120  # Slurm sends SIGTERM this long before the time limit, so the worker can upload
 
 
@@ -244,7 +247,8 @@ def context_files(context):
 def existing_image(machine):
     """An image already on the machine (container = PATH.sif), named by its path, size and time, so
     a replaced file makes a new environment (and new builds) rather than reusing old ones."""
-    done = ssh(machine, "stat -L -c %%s:%%.9Y %s" % machine["container"])  # size, mtime to the nanosecond
+    done = ssh(machine, "\n".join(["set -e"] + machine["setup"] + ["python3 -c %s %s" % (
+        shlex.quote(STAMP), machine["container"])]))
     stamp = (done.stdout.split() or [""])[-1]
     if done.returncode or ":" not in stamp:
         raise Refusal("%s has no image %s" % (machine["name"], machine["container"]))
