@@ -128,7 +128,7 @@ class SubmitTests(unittest.TestCase):
     def submit(self, *argv):
         out = io.StringIO()
         with Cwd(self.repo), redirect_stdout(out), mock.patch("sys.stderr", io.StringIO()) as err:
-            code = cli.main(["submit"] + list(argv))
+            code = cli.main(["submit", "--on", "aws"] + list(argv))
         return code, out.getvalue(), err.getvalue()
 
     def test_dry_run_plans_the_cheapest_instance_newest_base_and_estimate(self):

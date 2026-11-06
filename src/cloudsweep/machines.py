@@ -10,7 +10,8 @@ Describe machines once in ~/.config/cloudsweep/machines.ini, or for one project 
   [pembroke2]
   kind = ssh                    # a pool on the machine itself, one command per slot
 
-`--on local` runs a pool on this host and needs no section. cloudsweep reaches other machines
+Without --on, or with `--on local`, a sweep runs in a pool on this host, which needs no section;
+`--on aws` runs it on the project's AWS Batch deployment instead. cloudsweep reaches other machines
 with the system ssh and rsync under their ssh alias (host, by default the section name), so ssh's
 own configuration applies, including a ControlMaster connection to a machine that needs a
 password and Duo. Each command runs the worker in the machine's own environment, against a
@@ -37,11 +38,13 @@ from . import core, engine, fetch, project, settings
 from .project import Refusal
 
 FILE = "machines.ini"
-COMMON = {"kind", "host", "workdir", "setup", "container"}
+COMMON = {"kind", "host", "workdir", "setup", "container", "use"}
 KEYS = {"slurm": COMMON | {"sbatch", "cpu_sbatch", "gpu_sbatch", "gpu_type"},
         "ssh": COMMON | {"slots", "gpus", "systemd"}}
 GPU_TYPE_RE = re.compile(r"[A-Za-z0-9_.-]+")
-LOCAL = "local"  # as a host: this machine, without ssh; as a machine name: built in
+SIF_RE = re.compile(r"(~/|/)[A-Za-z0-9._+@%=,/-]+")  # an image already on the machine; unquoted in scripts
+LOCAL = "local"  # as a host: this machine, without ssh; as a machine name: built in, and the default
+AWS = "aws"  # the machine name of the project's AWS Batch deployment, which this module does not run
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]*")
 WORKDIR_RE = re.compile(r"(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._+@%=,/][A-Za-z0-9._+@%=,/-]*")  # unquoted in scripts
@@ -61,11 +64,8 @@ def files(repo):
     return [settings.state_dir(repo) / FILE, user]
 
 
-def load(repo, name):
-    """One machine's settings, checked."""
-    if not NAME_RE.fullmatch(name or ""):
-        raise Refusal("invalid machine name %r" % name)
-    names = []
+def sections(repo):
+    """(name, section, where) for every machine described, the project's file first."""
     for file in files(repo):
         if not file.is_file():
             continue
@@ -74,16 +74,60 @@ def load(repo, name):
             parser.read_string(file.read_text(), source=str(file))
         except configparser.Error as error:
             raise Refusal("%s: %s" % (file, error))
-        if parser.has_section(name):
-            return machine(name, parser[name], "[%s] in %s" % (name, file))
-        names += parser.sections()
+        for name in parser.sections():
+            yield name, parser[name], "[%s] in %s" % (name, file)
+
+
+def load(repo, name):
+    """One machine's settings, checked."""
+    if not NAME_RE.fullmatch(name or ""):
+        raise Refusal("invalid machine name %r" % name)
+    names = []
+    for found, section, where in sections(repo):
+        if found == name:
+            return machine(name, section, where)
+        names.append(found)
     if name == LOCAL:
         return machine(name, {}, "the built-in local machine")
-    raise Refusal("no machine [%s] in %s; `--on local` runs on this host. Machines described: %s"
-                  % (name, " or ".join(str(file) for file in files(repo)), ", ".join(sorted(set(names))) or "none"))
+    raise Refusal("no machine [%s] in %s; `--on local` runs on this host and `--on aws` on AWS. Machines "
+                  "described: %s" % (name, " or ".join(str(file) for file in files(repo)),
+                                     ", ".join(sorted(set(names))) or "none"))
+
+
+def show(args):
+    """cloudsweep machines: every machine this project can run on, and what each is for."""
+    repo, rows, seen = project.repository(), [], set()
+    for name, section, where in sections(repo):
+        if name in seen:
+            continue
+        seen.add(name)
+        try:
+            rows.append(machine(name, section, where))
+        except (Refusal, ValueError) as error:  # a malformed section is reported, the others still listed
+            rows.append({"name": name, "kind": "?", "host": "?", "container": None, "use": str(error)})
+    if LOCAL not in seen:
+        rows.append(machine(LOCAL, {}, "the built-in local machine"))
+    if settings.settings_path(repo).is_file():
+        on = settings.read_values(settings.settings_path(repo)).get(settings.ENABLED) == "1"
+        rows.append({"name": AWS, "kind": "aws", "host": "AWS Batch", "container": "its image",
+                     "use": "the project's AWS Batch deployment: CPU only, and it costs money (docs/admin.md)" if on
+                     else "the project's AWS deployment, with cloud use off (%s=0)" % settings.ENABLED})
+    for row in rows:
+        row["default"] = row["name"] == LOCAL
+    if args.json:
+        print(json.dumps(rows, indent=2, sort_keys=True))
+        return 0
+    for row in rows:
+        reach = "this host" if row["host"] == LOCAL else row["host"]
+        print("%-16s %-5s %-26s %s" % (row["name"] + (" (default)" if row["default"] else ""), row["kind"],
+                                       reach + (", in a container" if row["container"] else ""), row["use"]))
+    return 0
 
 
 def machine(name, section, where):
+    if name == AWS:
+        raise Refusal("%s: aws names the project's AWS deployment (--on aws); give this machine another name"
+                      % where)
     kind = section.get("kind", "ssh" if name == LOCAL else "").strip()
     if kind not in KEYS:
         raise Refusal("%s: kind must be slurm or ssh" % where)
@@ -101,10 +145,14 @@ def machine(name, section, where):
                       "the machine's home directory)" % where)
     if host == LOCAL and not workdir.startswith("/"):
         workdir = str(Path.home() / workdir)
-    container = section.get("container", "").strip().lower() or None
-    if container not in (None, "apptainer", "singularity"):
-        raise Refusal("%s: container must be apptainer (or left out to run in the machine's own environment)" % where)
-    result = {"name": name, "kind": kind, "host": host, "workdir": workdir, "container": container and "apptainer",
+    container = section.get("container", "").strip() or None
+    if container and container.lower() in ("apptainer", "singularity"):
+        container = "apptainer"
+    elif container and not (SIF_RE.fullmatch(container) and container.endswith(".sif")):
+        raise Refusal("%s: container must be apptainer (an image built from [image]), the path of a .sif image on "
+                      "the machine, or left out to run in the machine's own environment" % where)
+    result = {"name": name, "kind": kind, "host": host, "workdir": workdir, "container": container,
+              "use": " ".join(section.get("use", "").split()),
               "setup": [line.strip() for line in section.get("setup", "").splitlines() if line.strip()]}
     if kind == "slurm":
         for key in ("sbatch", "cpu_sbatch", "gpu_sbatch"):
@@ -191,6 +239,17 @@ def context_files(context):
     """The Docker build context's files, without the directories Git and cloudsweep keep there."""
     return [path for path in sorted(Path(context).rglob("*")) if path.is_file() and
             not {".git", ".cloudsweep"} & set(path.relative_to(context).parts)]
+
+
+def existing_image(machine):
+    """An image already on the machine (container = PATH.sif), named by its path, size and time, so
+    a replaced file makes a new environment (and new builds) rather than reusing old ones."""
+    done = ssh(machine, "stat -L -c %%s:%%.9Y %s" % machine["container"])  # size, mtime to the nanosecond
+    stamp = (done.stdout.split() or [""])[-1]
+    if done.returncode or ":" not in stamp:
+        raise Refusal("%s has no image %s" % (machine["name"], machine["container"]))
+    key = core.sha256_bytes(("%s\0%s" % (machine["container"], stamp)).encode())[:16]
+    return {"key": key, "sif": machine["container"], "stamp": stamp}
 
 
 def stage_image(tree, image):
@@ -326,7 +385,9 @@ def submit(args, prepare):
         if machine["kind"] == "ssh" and gpus and machine["gpus"] == 0:
             raise Refusal("these commands need GPUs; [%s] sets gpus = 0" % machine["name"])
         image = None
-        if machine["container"] and not args.dry_run:
+        if machine["container"] and machine["container"] != "apptainer" and not args.dry_run:
+            image = existing_image(machine)
+        elif machine["container"] and not args.dry_run:
             arch = ssh(machine, "uname -m").stdout.split()
             target = PLATFORM_OF.get(arch[-1] if arch else "")
             if not target:
@@ -343,7 +404,9 @@ def submit(args, prepare):
                "commit": commit, "build": build, "image_digest": digest, "count": len(commands),
                "seconds": core.timeout_seconds(hours), "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus,
                "setup": machine["setup"]}
-        if image:
+        if image and image.get("sif"):
+            job["container"] = {"key": image["key"], "sif": image["sif"], "stamp": image["stamp"]}
+        elif image:
             job["container"] = {"key": image["key"], "check": None if image["tag"] else image["spec"]["check"]}
         workdir, script = machine["workdir"], None
         plan = {"submission": submission, "machine": machine["name"], "kind": machine["kind"],
@@ -352,7 +415,9 @@ def submit(args, prepare):
                 "image_digest": digest}
         if machine["container"] and not image:
             plan["container"] = "apptainer; the image is built when you submit"
-        if image:
+        if image and image.get("sif"):
+            plan["container"] = "apptainer, the machine's image %s" % image["sif"]
+        elif image:
             plan["container"] = "apptainer, image %s built %s" % (image["key"], "here" if image["tag"] else
                                                                   "on the machine (this host cannot build for it)")
         if machine["kind"] == "slurm":
@@ -373,7 +438,7 @@ def submit(args, prepare):
         # uploads the checkout and builds it, and a concurrent one waits for that build.
         # Each of the build and the image is reused when there; otherwise the submission that takes
         # its lock uploads what makes it, and a concurrent one waits for it.
-        locks = ["builds/" + build] + (["images/" + image["key"]] if image else [])
+        locks = ["builds/" + build] + (["images/" + image["key"]] if image and not image.get("sif") else [])
         probe = ssh(machine, "set -e; umask 077; mkdir -p {w}/builds {w}/images {w}/jobs {w}/store/inputs "
                              "{w}/store/runs\n".format(w=workdir) + "\n".join(
             "if [ -f {w}/{d}/{f} ]; then echo built; elif mkdir {w}/{d}.lock 2>/dev/null; then echo {s} > "
@@ -481,12 +546,21 @@ def receipts(repo, name):
 
 
 def machine_of(repo, submission):
-    """The machine a submission went to, from its receipt; None for AWS (or no receipt)."""
+    """The machine a submission went to, from its receipt (AWS receipts name none, and may be kept
+    where the deployment's RECEIPTS says); local without one."""
+    places = [settings.state_dir(repo) / "receipts"]
     try:
-        receipt = json.loads((settings.state_dir(repo) / "receipts" / (submission + ".json")).read_text())
-        return receipt.get("machine") if isinstance(receipt, dict) else None
-    except (OSError, ValueError):
-        return None
+        places.append(Path(settings.read_values(settings.settings_path(repo))["RECEIPTS"]))
+    except (OSError, ValueError, KeyError):
+        pass
+    for place in places:
+        try:
+            receipt = json.loads((place / (submission + ".json")).read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(receipt, dict):
+            return receipt.get("machine") or AWS
+    return LOCAL
 
 
 def describe(submission, row):
@@ -603,16 +677,19 @@ def fetch_results(args, name):
     return 0 if summary["complete"] else 1
 
 
-def doctor(name):
-    """cloudsweep doctor --on MACHINE: reach the machine and report what cloudsweep needs there."""
-    repo = project.repository()
+def doctor(repo, name, row):
+    """cloudsweep doctor's machine checks: reach the machine and report what cloudsweep needs there."""
     machine = load(repo, name)
-    print("%-10s ok   %s: %s via %s, workdir %s" % ("machine", name, machine["kind"],
-                                                     "this host" if machine["host"] == LOCAL else "ssh " + machine["host"],
-                                                     machine["workdir"]), flush=True)
+    row("machine", True, "%s: %s via %s, workdir %s" % (name, machine["kind"], "this host" if machine["host"] == LOCAL
+                                                        else "ssh " + machine["host"], machine["workdir"]))
     result = call(machine, "check", machine["kind"], "1" if machine["kind"] == "ssh" and machine["gpus"] else "0",
                   "1" if machine["container"] else "0")
-    rows = [("reached", True, result["host"])] + [tuple(row) for row in result["rows"]]
-    for label, ok, detail in rows:
-        print("%-10s %s  %s" % (label, "ok " if ok else "-- ", detail))
-    return 0 if all(ok for _, ok, _ in rows) else 1
+    row("reached", True, result["host"])
+    for label, ok, detail in result["rows"]:
+        row(label, ok, detail)
+    if machine["container"] and machine["container"] != "apptainer":
+        try:
+            existing_image(machine)
+            row("image", True, machine["container"])
+        except Refusal as error:
+            row("image", False, str(error))

@@ -61,7 +61,7 @@ alarms. Compute scales down after jobs finish; retained storage, the guard and a
 cost money. Inspect storage with
 `cloudsweep status --storage`; the administrator can delete unneeded data.
 
-`deploy` records current instance prices. `submit` prints an **estimate** (cheapest fitting
+`deploy` records current instance prices. `submit --on aws` prints an **estimate** (cheapest fitting
 instance × time limit) and **worst case** (most expensive deployed fitting instance × time limit).
 Both price a whole instance per command. Sharing or finishing early reduces cost; host-failure
 retries, startup, idle time and non-compute charges add to these figures. Neither is a bill cap.
@@ -69,7 +69,7 @@ retries, startup, idle time and non-compute charges add to these figures. Neithe
 | Control | Default | Enforcement and gap |
 |---|---|---|
 | `--max-vcpus` | 32 | Batch cap; may exceed it by one instance |
-| `CLOUDSWEEP_MAX_RUN_USD` | $10 | local `submit` check against one command's worst case; excludes the additional costs above and does not limit the whole sweep |
+| `CLOUDSWEEP_MAX_RUN_USD` | $10 | `submit --on aws` check, before submitting, against one command's worst case; excludes the additional costs above and does not limit the whole sweep |
 | `--cutoff` | $100/month | guard stops work at reported spend; billing lags usage by hours, so the bill can exceed it |
 | `--alerts A1,A2` | $50,$80 | monthly email alerts |
 
@@ -87,7 +87,7 @@ apply while the tag is inactive.
 
 Administrators can edit the untracked `.cloudsweep/deploy.env`, which records deployment names,
 types, prices and local limits. Initially `CLOUDSWEEP_ENABLED=1` and `CLOUDSWEEP_MAX_RUN_USD=10`.
-`CLOUDSWEEP_ENABLED=0` blocks local `submit` and `image publish`; existing jobs continue until
+`CLOUDSWEEP_ENABLED=0` blocks `submit --on aws` and `image publish`; existing jobs continue until
 cancelled. These local controls are not AWS enforcement. If the ceiling blocks long runs,
 deploy without larger types or raise the local ceiling.
 

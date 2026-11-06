@@ -33,7 +33,7 @@ To run on AWS, configure your default administrator profile and review
 read -r -p "Budget alert email: " CLOUDSWEEP_ALERT_EMAIL
 cloudsweep deploy --email "$CLOUDSWEEP_ALERT_EMAIL"
 cloudsweep image publish
-cloudsweep submit --commands sweep.jsonl --input traces/footprint.txt
+cloudsweep submit --on aws --commands sweep.jsonl --input traces/footprint.txt
 read -r -p "Submission ID printed above: " CLOUDSWEEP_SUBMISSION
 cloudsweep fetch "$CLOUDSWEEP_SUBMISSION" --wait
 ```

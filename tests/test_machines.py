@@ -217,12 +217,27 @@ class MachineTests(MachineFixture):
         self.assertEqual(code, 0, out)
         self.assertEqual((destination / submission / "1/1/out/gpus.txt").read_text(), "none\n")
 
-    def test_this_host_needs_no_settings(self):
+    def test_this_host_needs_no_settings_and_is_the_default(self):
         (self.repo / ".cloudsweep/machines.ini").unlink()
-        submission, out = self.submit("local")
+        code, out = self.cli("submit", "--commands", str(self.sweep), "--input", "trace.bin")  # no --on
+        self.assertEqual(code, 0, out)
+        self.assertIn(" on local (", out)
+        submission = re.search(r"submitted (\S+):", out).group(1)
         self.wait_for_pool(self.home / "cloudsweep", submission)  # the default workdir, ~/cloudsweep
+        self.assertIn("%s FINISHED" % submission, self.cli("status")[1])  # this checkout's, on local
+        self.assertEqual(self.cli("cancel", "--all")[0], 0)
         self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
         self.assertFalse(self.log.exists())  # no ssh
+        other = "20261106T000000Z-aaaaaa"
+        self.assertEqual(machines.machine_of(self.repo, other), "local")  # no receipt here
+        kept = self.root / "aws-receipts"  # where a deployment's RECEIPTS may keep them
+        kept.mkdir()
+        (self.repo / ".cloudsweep/deploy.env").write_text("RECEIPTS=%s\n" % kept)
+        (kept / (other + ".json")).write_text(json.dumps({"submission": other}))
+        self.assertEqual(machines.machine_of(self.repo, other), "aws")  # AWS receipts name no machine
+        code, out = self.cli("status", other, submission)
+        self.assertEqual(code, 1)
+        self.assertIn("ran on AWS and the others on machines", out)
 
     def test_machines_can_be_described_once_per_user(self):
         user = self.root / "config" / "cloudsweep"
@@ -322,6 +337,25 @@ class MachineTests(MachineFixture):
         machines.release(machine, "builds/abc", "20261106T000000Z-bbbbbb")
         self.assertFalse(lock.exists())
 
+    def test_machines_lists_every_machine_and_what_it_is_for(self):
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("\n[noted]\nkind = ssh\nhost = fakehost\nuse = idle 48 cores; free\n")
+        code, out = self.cli("machines")
+        self.assertEqual(code, 0, out)
+        self.assertIn("idle 48 cores; free", out)
+        names = [row["name"] for row in json.loads(self.cli("machines", "--json")[1])]
+        self.assertEqual(names, ["cluster", "box", "gpubox", "broken", "noted", "local"])
+        self.assertIn("local (default)", out)
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write('\n[bad]\nkind = slurm\nsbatch = --partition="\n')  # one bad section hides no others
+        (self.repo / ".cloudsweep/deploy.env").write_text("CLOUDSWEEP_ENABLED=0\n")
+        rows = {row["name"]: row for row in json.loads(self.cli("machines", "--json")[1])}
+        self.assertEqual(list(rows), ["cluster", "box", "gpubox", "broken", "noted", "bad", "local", "aws"])
+        self.assertIn("No closing quotation", rows["bad"]["use"])
+        self.assertIn("cloud use off", rows["aws"]["use"])
+        (self.repo / ".cloudsweep/deploy.env").write_text("CLOUDSWEEP_ENABLED=1\n")
+        self.assertIn("costs money", self.cli("machines")[1])
+
     def test_settings_are_checked(self):
         file = self.repo / ".cloudsweep/machines.ini"
         for text, message in (("[m]\nkind = pbs\n", "kind must be slurm or ssh"),
@@ -335,6 +369,9 @@ class MachineTests(MachineFixture):
             machines.load(self.repo, "other")
         file.write_text("[m]\nkind = slurm\nworkdir = ~/sweeps\n")
         self.assertEqual(machines.load(self.repo, "m")["workdir"], "sweeps")
+        file.write_text("[aws]\nkind = ssh\n")
+        with self.assertRaisesRegex(project.Refusal, "aws names the project's AWS deployment"):
+            machines.load(self.repo, "aws")
 
     def test_setup_lines_are_part_of_the_build_identity_and_section_names_are_not(self):
         machine = machines.load(self.repo, "cluster")
@@ -437,6 +474,47 @@ class ContainerTests(MachineFixture):
         job, images, _ = self.run_sweep(self.built_here() + [mock.patch.object(machines.shutil, "which", which)])
         self.assertTrue((images / "base.sif").is_file())
         self.assertFalse((images / "base.tar").exists())
+
+    def given_image(self):
+        given = self.root / "given.sif"
+        given.write_text("an image")
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("\n[given]\nkind = ssh\nhost = fakehost\nworkdir = %s/given\ncontainer = %s\n"
+                         % (self.root, given))
+
+    def test_an_image_already_on_the_machine_is_used_as_it_is(self):
+        self.given_image()
+        submission, out = self.submit("given")
+        self.wait_for_pool(self.root / "given", submission)
+        self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
+        self.assertIn("apptainer exec /opt/cloudsweep /store /work\n", self.log.read_text())  # cloudsweep's worker, bound in
+        self.assertRegex(self.cli("doctor", "--on", "given")[1], r"image +ok +%s" % re.escape(str(self.root / "given.sif")))
+        (self.root / "given.sif").unlink()
+        self.assertRegex(self.cli("doctor", "--on", "given")[1], r"image +-- +given has no image")
+        self.assertFalse((self.root / "given/images").exists() and any((self.root / "given/images").iterdir()))
+
+    def test_an_image_replaced_after_its_submission_is_refused(self):
+        self.given_image()
+        found = machines.existing_image
+        with mock.patch.object(machines, "existing_image", lambda machine: dict(found(machine), stamp="1:0.0")):
+            _, out = self.submit("given", expect=1)  # as if the file had another size and time at submission
+        self.assertIn("changed after this submission", out)
+        submission, _ = self.submit("given")
+        self.wait_for_pool(self.root / "given", submission)
+        site = remote.Site(self.root / "given", submission)
+        (self.root / "given.sif").write_text("another image")  # replaced after the build
+        self.assertTrue(remote.image_changed(site))
+        site.job["container"]["stamp"] = remote.image_stamp(self.root / "given.sif")
+        record, lock = site.build / "build.json", site.root / "builds" / (site.job["build"] + ".lock")
+        record.unlink()
+        lock.mkdir()
+        (lock / "owner").write_text(submission)  # as the submission that builds it again takes the lock
+        rebuild = ["sh", "-c", "echo {} > build.json"]  # stands in for the worker's build, which writes the record
+        with mock.patch.object(remote, "image_changed", return_value=True), \
+                mock.patch.object(remote, "in_container", return_value=rebuild):  # replaced while it builds
+            with self.assertRaisesRegex(ValueError, "changed during the build"):
+                remote.build(site)
+        self.assertFalse(record.exists())  # never reused under the key of the image it was submitted with
 
     def test_the_machine_builds_the_image_only_when_this_host_cannot(self):
         job, images, log = self.run_sweep([mock.patch.object(machines, "builds_here", return_value=False)])

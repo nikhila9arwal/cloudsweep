@@ -176,7 +176,7 @@ def main(args):
         return settings.fail("invalid submission id %r" % args.submission)
     from . import machines  # it builds on this module
     name = args.on or machines.machine_of(project.repository(), args.submission)
-    if name:
+    if name != machines.AWS:
         return machines.fetch_results(args, name)
     values = settings.load(project.repository())
     aws = settings.aws_for(values)
@@ -195,8 +195,8 @@ def add_arguments(commands):
                         help="directory to place SUBMISSION/ in (default ./cloudsweep-results)")
     parser.add_argument("--wait", type=int, nargs="?", const=24 * 60, metavar="MINUTES",
                         help="first wait until the submission finishes (default at most a day)")
-    parser.add_argument("--on", metavar="MACHINE", help="from a machine in .cloudsweep/machines.ini, with rsync "
-                        "(default: the machine the receipt names, else AWS)")
+    parser.add_argument("--on", metavar="MACHINE", help="where it ran: local, a machine from machines.ini (copied "
+                        "with rsync), or aws (default: the machine the receipt names, else local)")
     parser.set_defaults(handler=main)
 
 

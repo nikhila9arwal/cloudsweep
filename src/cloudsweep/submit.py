@@ -1,14 +1,14 @@
-"""Run committed commands on AWS Batch (billable), or on a machine of your own.
+"""Run committed commands on this host, on a machine of your own, or on AWS Batch (billable).
 
-  cloudsweep submit --hours 2 -- {bin} --config configs/a.yaml --out {out}
-  cloudsweep submit --hours 2 --commands sweep.jsonl --input data/trace.bin
-  cloudsweep submit --on deltaai --commands sweep.jsonl     (a machine in .cloudsweep/machines.ini)
+  cloudsweep submit --hours 2 -- {bin} --config configs/a.yaml --out {out}     (this host)
+  cloudsweep submit --on deltaai --commands sweep.jsonl --input data/trace.bin  (a machine in machines.ini)
+  cloudsweep submit --on aws --hours 2 --commands sweep.jsonl                   (the AWS deployment)
 
 Sweep files contain one JSON argument list per line. Tracked edits are refused.
 Placeholders: {bin} program, {out} outputs, {src} checkout, {index} zero-based command
 index, {input:NAME} input path. Use {{ and }} for literal braces.
 
-The local per-run ceiling checks the most expensive fitting deployed instance for
+On AWS, the local per-run ceiling checks the most expensive fitting deployed instance for
 the time limit. Retries, startup, idle time and non-compute charges are additional.
 See docs/admin.md for cost controls and gaps; docs/running.md for commands and sizing.
 """
@@ -90,13 +90,13 @@ def submit_job(aws, queue, name, definition, submission, hours, size, vcpus, mem
                         json.dumps([{"name": "JOB_NAME", "values": [name]}]))
         except settings.AwsError as lookup_error:
             raise Refusal("submission outcome unknown for %s: %s; lookup failed: %s. Inspect the receipt "
-                          "and `cloudsweep status` before trying again; nothing was resubmitted."
+                          "and `cloudsweep status --on aws` before trying again; nothing was resubmitted."
                           % (name, error, lookup_error)) from error
         jobs = [job for job in found.get("jobSummaryList", []) if job.get("jobName") == name]
         if len(jobs) == 1:
             return jobs[0]["jobId"]
         raise Refusal("submission outcome unknown for %s: %s; lookup found %d exact matches. Inspect the "
-                      "receipt and `cloudsweep status` before trying again; nothing was resubmitted."
+                      "receipt and `cloudsweep status --on aws` before trying again; nothing was resubmitted."
                       % (name, error, len(jobs))) from error
 
 
@@ -275,22 +275,31 @@ def check_command_args(parser, args):
         parser.error("give either one command after -- or --commands FILE")
 
 
+def route(parser, args):
+    """Without --on, run on this host; --on aws takes the AWS path, any other name a machine."""
+    check_command_args(parser, args)
+    if args.on == machines.AWS:
+        return main(args)
+    args.on = args.on or machines.LOCAL
+    return machines.submit(args, prepare)
+
+
 def add_arguments(commands):
-    parser = commands.add_parser("submit", help="run commands on AWS Batch, or on a machine with --on",
+    parser = commands.add_parser("submit", help="run commands on this host, a machine of yours, or AWS (--on)",
                                  description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common(parser)
     parser.add_argument("--on", metavar="MACHINE",
-                        help="run on a machine from .cloudsweep/machines.ini instead (docs/machines.md)")
+                        help="where to run: local (this host, the default), a machine from machines.ini, or aws "
+                             "(docs/machines.md; `cloudsweep machines` lists them)")
     parser.add_argument("--vcpus", type=int, help="vCPUs per command (default: [run] vcpus, else 1)")
     parser.add_argument("--memory-mib", type=int, help="memory per command in MiB (default: [run] memory_mib, "
                         "else %d)" % core.DEFAULT_MEMORY_MIB)
-    parser.add_argument("--gpus", type=int, help="GPUs per command, on machines only (default: [run] gpus, else 0)")
+    parser.add_argument("--gpus", type=int, help="GPUs per command, not on AWS (default: [run] gpus, else 0)")
     parser.add_argument("--isolated", action="store_true",
-                        help="reserve a whole instance of the largest type per command (timing experiments)")
+                        help="on AWS: reserve a whole instance of the largest type per command (timing experiments)")
     parser.add_argument("--label", default="", help="free text recorded in the manifest and receipt")
     parser.add_argument("--dry-run", action="store_true", help="check and estimate; build, upload and submit nothing")
-    parser.set_defaults(handler=lambda args: (check_command_args(parser, args),
-                                              machines.submit(args, prepare) if args.on else main(args))[1])
+    parser.set_defaults(handler=lambda args: route(parser, args))
 
     trial_parser = commands.add_parser(
         "try", help="run and verify commands locally in a container",

@@ -135,8 +135,29 @@ def apptainer():
     return found
 
 
+def image_stamp(path):
+    """An image file's size and modification time, as `stat -c %s:%.9Y` prints them."""
+    status = os.stat(str(path))
+    return "%d:%d.%09d" % ((status.st_size,) + divmod(status.st_mtime_ns, 10 ** 9))
+
+
+def image_changed(site):
+    """Whether the image a machine section names by path is no longer the one recorded at submission."""
+    spec = site.job.get("container") or {}
+    if not spec.get("sif"):
+        return False
+    try:
+        return image_stamp(image_path(site)) != spec["stamp"]
+    except OSError:
+        return True
+
+
 def image_path(site):
-    return site.root / "images" / site.job["container"]["key"] / "base.sif"
+    """The SIF commands run in: one cloudsweep made, or the machine's own (container = PATH.sif)."""
+    spec = site.job["container"]
+    if spec.get("sif"):
+        return Path(os.path.expanduser(spec["sif"]))
+    return site.root / "images" / spec["key"] / "base.sif"
 
 
 def in_container(site, work, env, store=False):
@@ -144,6 +165,8 @@ def in_container(site, work, env, store=False):
     /work and the home directory (apptainer sets HOME itself), the store at /store, and the host's
     GPUs (--nv) for GPU commands."""
     argv = [apptainer(), "exec", "--cleanenv", "--home", "%s:/work" % work]
+    if site.job["container"].get("sif"):  # the machine's own image lacks the worker cloudsweep layers in
+        argv += ["--bind", "%s:/opt/cloudsweep" % HERE]
     if store:
         argv += ["--bind", "%s:/store" % site.store]
     if site.job["gpus"]:
@@ -170,6 +193,11 @@ def ensure_image(site):
     built and sent, or, when the submitting host could not build for this machine, built here
     from the Dockerfile it sent. Returns whether this submission made it."""
     sif = image_path(site)
+    if site.job["container"].get("sif"):
+        core.require(sif.is_file(), "the machine's image %s is missing" % sif)
+        core.require(not image_changed(site), "the machine's image %s changed after this submission; submit "
+                     "again to use the new one" % sif)
+        return False
     lock = sif.parent.parent / (sif.parent.name + ".lock")
     if not my_turn(site, lock, sif, "the container image"):
         return False
@@ -242,9 +270,14 @@ def build(site):
                 sys.stderr.buffer.write(line)
                 sys.stderr.flush()
             process.wait()
+        changed = process.returncode == 0 and image_changed(site)
+        if changed and record.exists():  # built in another image than the one its key names: never reuse it
+            record.unlink()
     finally:
         shutil.rmtree(str(lock), ignore_errors=True)
     core.require(process.returncode == 0, "the build failed (exit %d); its log is %s" % (process.returncode, log))
+    if changed:
+        raise ValueError("the machine's image %s changed during the build; submit again" % site.job["container"]["sif"])
     return True
 
 
@@ -403,6 +436,9 @@ def child(site, index=None):
                     shutil.copyfile(str(site.build / name), str(scratch / name))
             except OSError as error:  # the worker records it in the attempt
                 env["CLOUDSWEEP_PREPARE_ERROR"] = "copying the built checkout for this command failed: %s" % error
+        if image_changed(site):
+            env["CLOUDSWEEP_PREPARE_ERROR"] = ("the machine's image %s changed after this submission; submit again to "
+                                               "run in the new one" % site.job["container"]["sif"])
         if not site.job.get("container"):
             os.environ.update(env, CLOUDSWEEP_WORK=str(scratch), CLOUDSWEEP_STORE="file://" + str(site.store))
             return worker.main(["run", site.submission])

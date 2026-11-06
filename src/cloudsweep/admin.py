@@ -533,7 +533,7 @@ def deploy(args):
             "cutoff sees no spend; the vCPU cap and the per-run ceiling still bound cost." % tag)
     if not previous:
         say("first deploy: confirm the subscription email AWS sent to %s (guard warnings)" % parameters["AlertEmail"])
-    say("next: `cloudsweep image build` and `cloudsweep image publish`, then `cloudsweep submit`")
+    say("next: `cloudsweep image build` and `cloudsweep image publish`, then `cloudsweep submit --on aws`")
     return 0
 
 

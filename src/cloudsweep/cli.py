@@ -1,4 +1,4 @@
-"""cloudsweep: run parameter sweeps from committed source on AWS Batch or your own machines.
+"""cloudsweep: run parameter sweeps from committed source on this host, your own machines or AWS Batch.
 
 Start with the README quick start. For your own project, run cloudsweep init.
 Use cloudsweep COMMAND --help for options and cloudsweep doctor to diagnose failures.
@@ -47,9 +47,7 @@ def init(args):
 
 def doctor(args):
     """Check each prerequisite and say what to do about the first ones missing."""
-    if args.on:
-        return machines.doctor(args.on)
-    rows = []
+    on, rows = args.on or machines.LOCAL, []
 
     def row(name, ok, detail):
         rows.append((name, ok, detail))
@@ -57,16 +55,17 @@ def doctor(args):
         return ok
 
     row("python", sys.version_info >= (3, 9), platform.python_version() + " (3.9+ needed here)")
-    aws = shutil.which("aws")
-    version = subprocess.run(["aws", "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                             universal_newlines=True).stdout.strip() if aws else ""
-    row("aws cli", version.startswith("aws-cli/2"), version or "missing: install AWS CLI v2")
-    try:
-        name = engine.engine_name()
-        found = subprocess.run([name, "--version"], stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
-        row("container engine", True, found)
-    except Refusal as error:
-        row("container engine", False, str(error))
+    if on == machines.AWS:
+        aws = shutil.which("aws")
+        version = subprocess.run(["aws", "--version"], stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                                 universal_newlines=True).stdout.strip() if aws else ""
+        row("aws cli", version.startswith("aws-cli/2"), version or "missing: install AWS CLI v2")
+        try:
+            name = engine.engine_name()
+            found = subprocess.run([name, "--version"], stdout=subprocess.PIPE, universal_newlines=True).stdout.strip()
+            row("container engine", True, found)
+        except Refusal as error:
+            row("container engine", False, str(error))
     row("git", bool(shutil.which("git")), "required")
     try:
         repo = project.repository()
@@ -74,17 +73,22 @@ def doctor(args):
     except Refusal as error:
         row("git repository", False, str(error))
         return 1
+    target = None if on == machines.AWS else machines.load(repo, on)
     try:
         config = project.load(repo)
         name = project.name(config)
         recipe = project.recipe(config)
-        project.image(config, repo)
+        if target is None or target["container"] == "apptainer":  # runs in the image [image] describes
+            project.image(config, repo)
         project.acceptance(config)
         row(project.NAME, True, "project %s; build %r; binary %s" % (name, recipe["command"], recipe["binary"]))
         committed = project.tracked(repo, "HEAD", project.NAME)
         row("committed recipe", committed, "in HEAD" if committed else "commit cloudsweep.ini: runs use committed files")
     except Refusal as error:
         row(project.NAME, False, str(error))
+    if on != machines.AWS:
+        machines.doctor(repo, on, row)
+        return 0 if all(ok for _, ok, _ in rows) else 1
     try:
         values = settings.load(repo)
         row("deployment", True, "%s in %s (%s)" % (values["PREFIX"], values["REGION"], values["_path"]))
@@ -128,8 +132,12 @@ def main(argv=None):
     start.add_argument("--build", help="build command, e.g. 'make -j' (default: none)")
     start.add_argument("--binary", help="the program {bin} names, relative to the checkout")
     start.set_defaults(handler=init)
-    check = commands.add_parser("doctor", help="check prerequisites and the deployment, or a machine with --on")
-    check.add_argument("--on", metavar="MACHINE", help="check a machine from machines.ini (or local) instead")
+    listing = commands.add_parser("machines", help="list the machines you can run on, and what each is for")
+    listing.add_argument("--json", action="store_true", help="machine-readable output")
+    listing.set_defaults(handler=machines.show)
+    check = commands.add_parser("doctor", help="check the project and a machine (default local), or the AWS "
+                                "deployment with --on aws")
+    check.add_argument("--on", metavar="MACHINE", help="local, a machine from machines.ini, or aws")
     check.set_defaults(handler=doctor)
     admin.add_arguments(commands)
     image.add_arguments(commands)

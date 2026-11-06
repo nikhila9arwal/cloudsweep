@@ -39,29 +39,32 @@ reservations do not. Use it to catch missing files and libraries before paying f
 ## submit
 
 ```bash
-cloudsweep submit --hours 2 -- {bin} --sets 64 --out {out}
-cloudsweep submit --dry-run --commands sweep.jsonl --input traces/a.txt
-cloudsweep submit --commands sweep.jsonl --input traces/a.txt
+cloudsweep submit --hours 2 -- {bin} --sets 64 --out {out}                      # this host
+cloudsweep submit --on aws --dry-run --commands sweep.jsonl --input traces/a.txt
+cloudsweep submit --on aws --commands sweep.jsonl --input traces/a.txt
 ```
 
-**AWS runs cost money.** `--dry-run` checks and estimates without building, uploading or submitting.
-See [costs and limits](admin.md#costs-and-limits) for the estimate, ceiling and billing gaps.
+Without `--on`, `submit` runs on this host; `--on MACHINE` runs on [your own machine](machines.md)
+and `--on aws` on AWS Batch. **AWS runs cost money.** `--dry-run` checks and plans without
+building, uploading or submitting; on AWS it prints the estimate. See
+[costs and limits](admin.md#costs-and-limits) for the estimate, ceiling and billing gaps.
 
 | Option | Meaning |
 |---|---|
 | `--hours H` | per-command time limit: 60 seconds to 14 days; defaults to `[run] hours` |
 | `--vcpus N`, `--memory-mib M` | per-command reservations; defaults from `[run]`, else 1 and 3500 |
-| `--on MACHINE`, `--gpus N` | run on [your own machine](machines.md) instead of AWS; GPUs per command there |
+| `--on WHERE` | `local` (this host, the default), a machine from [machines.ini](machines.md), or `aws` |
+| `--gpus N` | GPUs per command, not on AWS; defaults to `[run] gpus`, else 0 |
 | `--revision REV` | committed revision; default `HEAD` |
-| `--isolated` | reserve the largest deployed instance's CPU and usable memory per command |
+| `--isolated` | on AWS, reserve the largest deployed instance's CPU and usable memory per command |
 | `--label TEXT` | label saved with the submission |
 
-Commit tracked changes and `cloudsweep.ini` first. Unknown placeholders, disabled cloud use,
-an active cutoff, requests that do not fit the instance types or cap, and costs above the
-per-run ceiling are refused.
+Commit tracked changes and `cloudsweep.ini` first; unknown placeholders are refused. On AWS, so
+are disabled cloud use, an active cutoff, requests that do not fit the instance types or cap, and
+costs above the per-run ceiling.
 
-Submission prints its ID, planned instance type and cost estimates, and writes a receipt under
-`.cloudsweep/receipts/`. **If the outcome is unknown, inspect that receipt and `cloudsweep status`
+Submission prints its ID (on AWS, also the planned instance type and cost estimates) and writes a receipt under
+`.cloudsweep/receipts/`. **If the outcome is unknown, inspect that receipt and `cloudsweep status SUBMISSION`
 before retrying.** cloudsweep does not automatically resubmit; rerunning `submit` can duplicate work.
 
 ### Sizing
@@ -74,12 +77,13 @@ or use `--isolated`. cloudsweep assumes 90% of memory is usable: 3,500 MiB fits 
 ## status
 
 ```bash
-cloudsweep status                     # submissions in the queue's history
-cloudsweep status SUBMISSION
-cloudsweep status --storage           # retained bucket objects and registry images
+cloudsweep status                     # this checkout's submissions on this host
+cloudsweep status SUBMISSION          # on the machine its receipt names
+cloudsweep status --on aws            # submissions in the AWS queue's history, capacity, spend
+cloudsweep status --storage           # retained AWS bucket objects and registry images
 ```
 
-Desired capacity is what Batch requested, not the number of running instances. Spend comes from
+On AWS, desired capacity is what Batch requested, not the number of running instances. Spend comes from
 the guard's [budget snapshot](admin.md#costs-and-limits) and lags usage. Status remains available
 when cloud use is off or the cutoff is active.
 
@@ -118,10 +122,10 @@ content. See [output limits](../README.md#limits) and [retry directories](how-it
 
 ```bash
 cloudsweep cancel SUBMISSION
-cloudsweep cancel --all --wait 30      # wait up to 30 minutes for capacity to reach zero
+cloudsweep cancel --on aws --all --wait 30   # wait up to 30 minutes for capacity to reach zero
 ```
 
-Waiting jobs are cancelled; active jobs are stopped. The command gets SIGTERM and 20 seconds to
+On AWS, waiting jobs are cancelled; active jobs are stopped. The command gets SIGTERM and 20 seconds to
 exit before being killed. The worker then attempts to upload outputs, but Batch kills the
 container after 30 seconds: partial results are best effort. Write them incrementally and expect
 some to be missing. Cancellation reports remaining capacity and works when cloud use is off

@@ -5,7 +5,8 @@ commands as on AWS. Each command runs in the machine's own environment: its comp
 Python and GPUs. No container is needed.
 
 ```bash
-cloudsweep submit --on local --commands sweep.jsonl            # this host; needs no settings
+cloudsweep machines                                            # where you can run, and what each is for
+cloudsweep submit --commands sweep.jsonl                       # this host (local); needs no settings
 cloudsweep submit --on deltaai --commands sweep.jsonl --gpus 1
 cloudsweep status <submission>
 cloudsweep fetch <submission> --wait
@@ -13,7 +14,8 @@ cloudsweep cancel <submission>
 ```
 
 `status`, `cancel` and `fetch` find the machine in the submission's receipt; `--on MACHINE` names
-it explicitly. `fetch` gives the same verified `cloudsweep-results/<submission>/` as from AWS: use
+it explicitly. Without `--on`, `submit` runs on this host, and `--on aws` sends the sweep to the
+project's AWS deployment. `fetch` gives the same verified `cloudsweep-results/<submission>/` as from AWS: use
 results only when it reports **`complete`**.
 
 ## Describe a machine
@@ -54,8 +56,9 @@ workdir = /projects/bbxx/me/cloudsweep
 
 There are two kinds. **`slurm`** submits one `sbatch --array` job per submission, one task per
 command, from the cluster's login node; cloudsweep writes the batch script. **`ssh`** runs a pool
-on the machine itself, one command per slot. `--on local` is a built-in `ssh` machine for this host
-(Linux only) that works without ssh; a `[local]` section changes its settings.
+on the machine itself, one command per slot. `local`, the default, is a built-in `ssh` machine for this host
+(Linux only) that works without ssh; a `[local]` section changes its settings. `aws` names the AWS
+deployment and cannot be a section.
 
 | Key | Kinds | Meaning (default) |
 |---|---|---|
@@ -63,7 +66,8 @@ on the machine itself, one command per slot. `--on local` is a built-in `ssh` ma
 | `host` | both | ssh alias or host name, or `local` for this host (the section name) |
 | `workdir` | both | directory on the machine for builds, jobs and results; relative paths are under its home directory; on a cluster it must be shared with the compute nodes (`cloudsweep`) |
 | `setup` | both | shell lines run first, in your home directory, one per line: module loads, a venv (none) |
-| `container` | both | `apptainer` runs commands in your project's toolchain image instead ([below](#containers)) (none) |
+| `container` | both | `apptainer` runs commands in your project's toolchain image, or the path of a `.sif` image already on the machine, such as `~/mirage.sif` ([below](#containers)) (none) |
+| `use` | both | a note on what the machine is for and when to ask before using it; `cloudsweep machines` shows it (none) |
 | `sbatch`, `cpu_sbatch`, `gpu_sbatch` | slurm | extra `sbatch` options for every job, CPU jobs and GPU jobs: account, partition (none) |
 | `gpu_type` | slurm | GPU type to request, such as `h100` (any) |
 | `slots` | ssh | CPU commands at once (the machine's CPUs ÷ `[run] vcpus`) |
@@ -114,6 +118,11 @@ Apptainer installed here, cloudsweep also converts the image to a SIF here; othe
 converts the archive it receives. Either way it is uploaded once per image. Only when this host has
 no podman or Docker, or cannot emulate the machine's architecture, does the machine build the image
 itself, with its own podman or Docker.
+
+To use an image that already exists on the machine instead, give its path, absolute or starting
+with `~/` (without spaces): `container = ~/mirage.sif`. cloudsweep mounts its worker into it, so the
+image needs only `python3` 3.6 or newer and git; nothing is built or uploaded. Replacing the file
+starts new builds, and a queued command refuses to run in a file replaced after its submission.
 
 On the machine, the revision is built inside the image (on a cluster's login node) with the
 checkout at `/work/src`, as on AWS, and each command runs with `apptainer exec`: its copy of the

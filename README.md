@@ -8,15 +8,16 @@ the commit in the machine's own environment, on CPUs or GPUs. On AWS each comman
 container built from your toolchain Dockerfile.
 
 ```bash
-cloudsweep submit --on local --commands sweep.jsonl          # this host
+cloudsweep submit --commands sweep.jsonl                      # this host
 cloudsweep submit --on deltaai --commands sweep.jsonl --gpus 1   # a Slurm cluster
-cloudsweep fetch <submission> --wait                          # verified results, from either
+cloudsweep submit --on aws --commands sweep.jsonl             # AWS Batch
+cloudsweep fetch <submission> --wait                          # verified results, from any of them
 ```
 
 ## Install
 
-You need Python 3.9+, Git and rsync. `--on local` needs Linux; from macOS you can run on other
-machines and AWS. Each machine you run on needs bash, git, rsync and Python 3.6+.
+You need Python 3.9+, Git and rsync. Running on this host, the default, needs Linux; from macOS you
+can run on other machines and AWS. Each machine you run on needs bash, git, rsync and Python 3.6+.
 
 To run commands on a machine in your toolchain image instead (`container = apptainer`), the machine
 needs Apptainer. The image is built here when you have Podman or Docker (with QEMU emulation for a
@@ -41,7 +42,7 @@ without them and submit `-- python3 simulate.py --out {out}` instead.
 cloudsweep init --build "make -j" --binary build/mysim    # writes cloudsweep.ini
 git add cloudsweep.ini .gitignore
 git commit -m "Run with cloudsweep"
-cloudsweep submit --on local -- {bin} --seed 1 --out {out}   # prints a submission ID
+cloudsweep submit -- {bin} --seed 1 --out {out}   # runs on this host; prints a submission ID
 cloudsweep fetch <submission> --wait
 ```
 
@@ -61,7 +62,7 @@ cat > sweep.jsonl <<'EOF'
 ["{bin}", "--seed", "1", "--out", "{out}"]
 ["{bin}", "--seed", "2", "--out", "{out}"]
 EOF
-cloudsweep submit --on local --commands sweep.jsonl
+cloudsweep submit --commands sweep.jsonl
 ```
 
 Write large sweeps with a short script, like the example's
@@ -96,6 +97,7 @@ sbatch = --account=bbxx-dtai-gh --partition=ghx4
 ```
 
 ```bash
+cloudsweep machines                   # lists them, with your note on what each is for (use =)
 cloudsweep doctor --on ece-gpu        # checks what the machine provides
 cloudsweep submit --on ece-gpu --commands sweep.jsonl
 cloudsweep submit --on ece-gpu --commands sweep.jsonl --gpus 1
@@ -103,9 +105,9 @@ cloudsweep submit --on ece-gpu --commands sweep.jsonl --gpus 1
 
 Commands use the machine's own compilers, modules and Python; `setup` lines load them (a module, or
 `source ~/venvs/sim/bin/activate`). To run in your toolchain image instead, as on AWS, add
-`container = apptainer`: cloudsweep builds the image on this host and sends it
-([containers](docs/machines.md#containers)). Set `[run] gpus = 1` in `cloudsweep.ini` to make every run of a
-project ask for a GPU. On a machine that needs a password and Duo, such as DeltaAI, you sign in once
+`container = apptainer`: cloudsweep builds the image on this host and sends it. Or name an image
+already on the machine, such as `container = ~/mirage.sif` ([containers](docs/machines.md#containers)).
+Set `[run] gpus = 1` in `cloudsweep.ini` to make every run of a project ask for a GPU. On a machine that needs a password and Duo, such as DeltaAI, you sign in once
 and cloudsweep reuses that connection; [your own machines](docs/machines.md) shows the ssh settings
 and every option.
 
@@ -136,12 +138,12 @@ cloudsweep image build                                # builds and checks the to
 cloudsweep try --commands sweep.jsonl                 # runs the sweep locally in that image
 cloudsweep deploy --admin-profile <admin profile> --email you@example.org
 cloudsweep image publish
-cloudsweep submit --dry-run --commands sweep.jsonl    # prints the cost estimate
-cloudsweep submit --commands sweep.jsonl              # without --on, submit uses AWS
+cloudsweep submit --on aws --dry-run --commands sweep.jsonl    # prints the cost estimate
+cloudsweep submit --on aws --commands sweep.jsonl
 cloudsweep fetch <submission> --wait
 ```
 
-`cloudsweep status` shows the month's reported spending. `cloudsweep admin retire --admin-profile
+`cloudsweep status --on aws` shows the queue and the month's reported spending. `cloudsweep admin retire --admin-profile
 <admin profile> --yes` removes the queue, compute and guard; the bucket and images stay, and are
 billed, until you add `--delete-data` (see [retire](docs/admin.md#retire)).
 
@@ -152,11 +154,13 @@ fetching and cancelling need no administrator rights, and the identity they use 
 the budget, the spending cutoff or permissions (it does not limit other credentials on your host). When cloudsweep refuses something (cloud use is off, the cutoff
 is active, a run would cost more than the per-run ceiling), it says why and what to do next. If it
 cannot tell whether a submission went through, it records a receipt and never resubmits on its own.
-[For AI agents](docs/agents.md) has instructions to paste into your project.
+`cloudsweep machines` shows an agent every machine you described and your note on what each is
+for. [For AI agents](docs/agents.md) has instructions to paste into your project.
 
 ## When something fails
 
-- `cloudsweep doctor` checks this host and AWS; `cloudsweep doctor --on MACHINE` checks a machine.
+- `cloudsweep doctor` checks the project and this host; add `--on MACHINE` for a machine, or
+  `--on aws` for the AWS deployment.
 - `cloudsweep status <submission>` counts commands by state, and `fetch` names each one that
   failed; `cloudsweep cancel <submission>` stops the work.
 - Each attempt's `stderr.txt` is in `cloudsweep-results/<submission>/<command>/<attempt>/` after
