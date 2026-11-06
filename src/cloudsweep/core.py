@@ -9,6 +9,7 @@ import json
 import os
 import re
 import secrets
+import shutil
 import tempfile
 from datetime import datetime, timezone
 from decimal import Decimal, InvalidOperation
@@ -176,7 +177,9 @@ def attempt_order(name):
 
 
 def submission_manifest(submission, commit, image_digest, base_digest, recipe, inputs, commands,
-                        vcpus, memory_mib, hours, label="", created=None):
+                        vcpus, memory_mib, hours, label="", created=None, gpus=0, machine=None):
+    """On a machine from machines.ini (machine names it), image_digest and base_digest identify the
+    build and the machine's environment instead of container images."""
     manifest = {
         "schema": SCHEMA, "submission": submission, "created": created or now_iso(),
         "commit": commit, "image_digest": image_digest, "base_digest": base_digest,
@@ -185,6 +188,10 @@ def submission_manifest(submission, commit, image_digest, base_digest, recipe, i
         "resources": {"vcpus": vcpus, "memory_mib": memory_mib, "hours": str(hours)},
         "label": label,
     }
+    if gpus:
+        manifest["resources"]["gpus"] = gpus
+    if machine:
+        manifest["machine"] = machine
     validate_submission(manifest)
     return manifest
 
@@ -206,7 +213,8 @@ def validate_submission(manifest):
             and 1 <= commands["count"] <= MAX_CHILDREN, "invalid commands record")
     resources = manifest.get("resources")
     require(isinstance(resources, dict) and type(resources.get("vcpus")) is int and resources["vcpus"] >= 1
-            and type(resources.get("memory_mib")) is int and resources["memory_mib"] >= 128,
+            and type(resources.get("memory_mib")) is int and resources["memory_mib"] >= 128
+            and type(resources.get("gpus", 0)) is int and resources.get("gpus", 0) >= 0,
             "invalid resources")
     timeout_seconds(resources.get("hours"))
     return manifest
@@ -313,26 +321,30 @@ class LocalStore:
         return self.root / key
 
     def put_bytes(self, data, key):
+        self.put_stream(lambda stream: stream.write(data), key)
+
+    def put_file(self, local, key):
+        with open(str(local), "rb") as source:  # in blocks: outputs may be larger than memory
+            self.put_stream(lambda stream: shutil.copyfileobj(source, stream, 1 << 20), key)
+
+    def put_stream(self, write, key):
         target = self.path(key)
         target.parent.mkdir(parents=True, exist_ok=True)
         handle, temporary = tempfile.mkstemp(dir=str(target.parent), prefix=".part-")
         with os.fdopen(handle, "wb") as stream:
-            stream.write(data)
+            write(stream)
         os.chmod(temporary, 0o644)
         os.replace(temporary, str(target))
-
-    def put_file(self, local, key):
-        self.put_bytes(Path(local).read_bytes(), key)
 
     def get_bytes(self, key):
         target = self.path(key)
         return target.read_bytes() if target.is_file() else None
 
     def get_file(self, key, local):
-        data = self.get_bytes(key)
-        require(data is not None, "missing object " + key)
+        source = self.path(key)
+        require(source.is_file(), "missing object " + key)
         Path(local).parent.mkdir(parents=True, exist_ok=True)
-        Path(local).write_bytes(data)
+        shutil.copyfile(str(source), str(local))
 
     def list(self, prefix):
         found = []

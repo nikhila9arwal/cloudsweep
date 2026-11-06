@@ -51,6 +51,7 @@ See [costs and limits](admin.md#costs-and-limits) for the estimate, ceiling and 
 |---|---|
 | `--hours H` | per-command time limit: 60 seconds to 14 days; defaults to `[run] hours` |
 | `--vcpus N`, `--memory-mib M` | per-command reservations; defaults from `[run]`, else 1 and 3500 |
+| `--on MACHINE`, `--gpus N` | run on [your own machine](machines.md) instead of AWS; GPUs per command there |
 | `--revision REV` | committed revision; default `HEAD` |
 | `--isolated` | reserve the largest deployed instance's CPU and usable memory per command |
 | `--label TEXT` | label saved with the submission |

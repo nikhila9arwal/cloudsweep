@@ -108,9 +108,9 @@ def image(config, repo):
 
 
 def run_defaults(config):
-    """[run] defaults for submit: vcpus, memory_mib, hours (each optional)."""
+    """[run] defaults for submit: vcpus, memory_mib, hours, gpus (each optional)."""
     found = {}
-    for key, cast in (("vcpus", int), ("memory_mib", int), ("hours", str)):
+    for key, cast in (("vcpus", int), ("memory_mib", int), ("hours", str), ("gpus", int)):
         if config.has_option("run", key):
             try:
                 found[key] = cast(config.get("run", key))
@@ -164,6 +164,8 @@ binary = {binary}
 vcpus = 1
 memory_mib = 3500
 hours = 1
+# GPUs per command, for machines in .cloudsweep/machines.ini (the AWS queue has none).
+# gpus = 1
 
 # Optional: a fixed run that must give a known result before a new base image is published.
 # [acceptance]

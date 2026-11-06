@@ -40,6 +40,15 @@ jobs:
           python-version: "3.8"
       - run: python -m py_compile src/cloudsweep/core.py src/cloudsweep/worker.py src/cloudsweep/s3lite.py
 
+  machine-python36:
+    # On users' machines the worker runs under the system Python, which may be 3.6.
+    name: machine code imports on Python 3.6
+    runs-on: ubuntu-latest
+    container: python:3.6-slim
+    steps:
+      - uses: actions/checkout@v4  # its Node 20 runs on this image's older C library
+      - run: cd src/cloudsweep && python -c "import core, worker, remote"
+
   template:
     name: CloudFormation template
     runs-on: ubuntu-latest

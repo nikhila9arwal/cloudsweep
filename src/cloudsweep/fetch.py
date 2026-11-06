@@ -174,6 +174,10 @@ def wait_for(aws, values, submission, minutes):
 def main(args):
     if not core.SUBMISSION_RE.fullmatch(args.submission):
         return settings.fail("invalid submission id %r" % args.submission)
+    from . import machines  # it builds on this module
+    name = args.on or machines.machine_of(project.repository(), args.submission)
+    if name:
+        return machines.fetch_results(args, name)
     values = settings.load(project.repository())
     aws = settings.aws_for(values)
     if args.wait is not None:
@@ -191,6 +195,8 @@ def add_arguments(commands):
                         help="directory to place SUBMISSION/ in (default ./cloudsweep-results)")
     parser.add_argument("--wait", type=int, nargs="?", const=24 * 60, metavar="MINUTES",
                         help="first wait until the submission finishes (default at most a day)")
+    parser.add_argument("--on", metavar="MACHINE", help="from a machine in .cloudsweep/machines.ini, with rsync "
+                        "(default: the machine the receipt names, else AWS)")
     parser.set_defaults(handler=main)
 
 

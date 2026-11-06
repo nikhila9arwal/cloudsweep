@@ -1,7 +1,8 @@
-"""Run committed commands on AWS Batch (billable).
+"""Run committed commands on AWS Batch (billable), or on a machine of your own.
 
   cloudsweep submit --hours 2 -- {bin} --config configs/a.yaml --out {out}
   cloudsweep submit --hours 2 --commands sweep.jsonl --input data/trace.bin
+  cloudsweep submit --on deltaai --commands sweep.jsonl     (a machine in .cloudsweep/machines.ini)
 
 Sweep files contain one JSON argument list per line. Tracked edits are refused.
 Placeholders: {bin} program, {out} outputs, {src} checkout, {index} zero-based command
@@ -20,7 +21,7 @@ import tempfile
 from decimal import Decimal
 from pathlib import Path
 
-from . import core, engine, fetch, project, settings
+from . import core, engine, fetch, machines, project, settings
 from .project import Refusal
 
 
@@ -65,7 +66,10 @@ def prepare(args, repo):
         raise Refusal(str(error))
     vcpus = args.vcpus or defaults.get("vcpus") or 1
     memory = args.memory_mib or defaults.get("memory_mib") or core.DEFAULT_MEMORY_MIB
-    return commit, recipe, files, commands, Decimal(str(hours)), vcpus, memory
+    gpus = args.gpus if args.gpus is not None else defaults.get("gpus", 0)
+    if gpus < 0:
+        raise Refusal("gpus must be 0 or more")
+    return commit, recipe, files, commands, Decimal(str(hours)), vcpus, memory, gpus
 
 
 def submit_job(aws, queue, name, definition, submission, hours, size, vcpus, memory):
@@ -105,7 +109,10 @@ def main(args):
     path, receipt = None, None
     try:
         values, aws = settings.admit(repo)
-        commit, recipe, files, commands, hours, vcpus, memory_mib = prepare(args, repo)
+        commit, recipe, files, commands, hours, vcpus, memory_mib, gpus = prepare(args, repo)
+        if gpus:
+            raise Refusal("the AWS queue has no GPU instances; run commands that need GPUs on a machine "
+                          "from .cloudsweep/machines.ini with --on (docs/machines.md)")
         types = values["INSTANCE_TYPES"]
         if args.isolated:
             spec = core.largest(types)[1]
@@ -239,7 +246,7 @@ def try_main(args):
     except Refusal:
         values = None
     try:
-        commit, recipe, files, commands, hours, _, _ = prepare(args, repo)
+        commit, recipe, files, commands, hours, _, _, _ = prepare(args, repo)
         name = project.name(project.load(repo, commit))
         base, base_digest = local_base(name, values)
         root = Path(args.keep) if args.keep else Path(tempfile.mkdtemp(prefix="cloudsweep-try-"))
@@ -269,17 +276,21 @@ def check_command_args(parser, args):
 
 
 def add_arguments(commands):
-    parser = commands.add_parser("submit", help="run commands on AWS Batch",
+    parser = commands.add_parser("submit", help="run commands on AWS Batch, or on a machine with --on",
                                  description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     add_common(parser)
+    parser.add_argument("--on", metavar="MACHINE",
+                        help="run on a machine from .cloudsweep/machines.ini instead (docs/machines.md)")
     parser.add_argument("--vcpus", type=int, help="vCPUs per command (default: [run] vcpus, else 1)")
     parser.add_argument("--memory-mib", type=int, help="memory per command in MiB (default: [run] memory_mib, "
                         "else %d)" % core.DEFAULT_MEMORY_MIB)
+    parser.add_argument("--gpus", type=int, help="GPUs per command, on machines only (default: [run] gpus, else 0)")
     parser.add_argument("--isolated", action="store_true",
                         help="reserve a whole instance of the largest type per command (timing experiments)")
     parser.add_argument("--label", default="", help="free text recorded in the manifest and receipt")
     parser.add_argument("--dry-run", action="store_true", help="check and estimate; build, upload and submit nothing")
-    parser.set_defaults(handler=lambda args: (check_command_args(parser, args), main(args))[1])
+    parser.set_defaults(handler=lambda args: (check_command_args(parser, args),
+                                              machines.submit(args, prepare) if args.on else main(args))[1])
 
     trial_parser = commands.add_parser(
         "try", help="run and verify commands locally in a container",
@@ -287,7 +298,7 @@ def add_arguments(commands):
                     "else pulls the newest published base. Enforces the time limit, not AWS CPU/memory reservations.")
     add_common(trial_parser)
     trial_parser.add_argument("--keep", help="new directory for the local store and results (default: a temporary one)")
-    trial_parser.set_defaults(vcpus=None, memory_mib=None,
+    trial_parser.set_defaults(vcpus=None, memory_mib=None, gpus=None,
                               handler=lambda args: (check_command_args(trial_parser, args), try_main(args))[1])
 
 

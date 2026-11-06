@@ -2,22 +2,21 @@
 
 [![CI](https://github.com/nikhila9arwal/cloudsweep/actions/workflows/ci.yml/badge.svg)](https://github.com/nikhila9arwal/cloudsweep/actions/workflows/ci.yml)
 
-cloudsweep runs parameter sweeps on AWS Batch from a Git project. Each command runs in a container
-built from your commit; `fetch` downloads and verifies the results. Use it with Linux
-command-line programs that read and write files.
+cloudsweep runs a sweep of commands from a Git commit on this host, a machine you reach over ssh, a
+Slurm cluster, or AWS Batch, and brings back verified results. On your machines it builds and runs
+the commit in the machine's own environment, on CPUs or GPUs. On AWS each command runs in a
+container built from your toolchain Dockerfile.
 
-```text
-Git commit + toolchain → revision image → AWS Batch → one container per command
-                                         ↑ inputs from S3    ↓ outputs to S3
-                                         verified results ← cloudsweep fetch
+```bash
+cloudsweep submit --on local --commands sweep.jsonl          # this host
+cloudsweep submit --on deltaai --commands sweep.jsonl --gpus 1   # a Slurm cluster
+cloudsweep fetch <submission> --wait                          # verified results, from either
 ```
 
 ## Install
 
-You need Linux or macOS, Python 3.9+, Git, Docker or Podman, and the
-[AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html).
-For AWS runs, configure an administrator profile; `deploy` creates a narrower agent profile for
-routine commands. Read the [permissions](docs/how-it-works.md#permissions) before using a shared account.
+You need Python 3.9+, Git and rsync. `--on local` needs Linux; from macOS you can run on other
+machines and AWS. Each machine you run on needs bash, git, rsync and Python 3.6+.
 
 ```bash
 git clone https://github.com/nikhila9arwal/cloudsweep
@@ -26,77 +25,158 @@ python3 -m venv .venv
 pip install ./cloudsweep
 ```
 
-Alternatively, add the cloned repository's `bin/` directory to `PATH`.
+## Run your project
 
-## Quick start
-
-From the directory where you cloned cloudsweep, copy the [cache simulator](examples/cache-sim/)
-into its own Git repository:
-
-```bash
-cp -R cloudsweep/examples/cache-sim cache-sim
-cd cache-sim
-git init
-git add .
-git commit -m "Add cache simulator"
-mkdir -p traces
-printf '6000\n' > traces/footprint.txt
-python3 configs/make_sweep.py             # writes sweep.jsonl
-cloudsweep image build                   # builds and checks the toolchain image
-cloudsweep try --commands sweep.jsonl --input traces/footprint.txt
-```
-
-Then run it on AWS. These steps create **billable resources**; see
-[deployment prerequisites](docs/admin.md#deploy) and [spending limits](docs/admin.md#costs-and-limits).
+Start in your project's Git repository, with your work committed. Replace the build command,
+program path and arguments with your own. For a script that needs no build, run `cloudsweep init`
+without them and submit `-- python3 simulate.py --out {out}` instead.
 
 ```bash
-cloudsweep deploy --admin-profile <admin profile> --email you@example.org
-cloudsweep image publish
-cloudsweep submit --commands sweep.jsonl --input traces/footprint.txt   # prints a submission ID
+cloudsweep init --build "make -j" --binary build/mysim    # writes cloudsweep.ini
+git add cloudsweep.ini .gitignore
+git commit -m "Run with cloudsweep"
+cloudsweep submit --on local -- {bin} --seed 1 --out {out}   # prints a submission ID
 cloudsweep fetch <submission> --wait
 ```
 
-Use results only when `fetch` reports **`complete`**. Resources retained after jobs finish still
-cost money; see [cleanup](docs/admin.md#retire). Use `cloudsweep doctor` to diagnose failures.
+`{bin}` is your built program and `{out}` the directory it writes results to. The results are in
+`cloudsweep-results/<submission>/0/1/`: `out/` holds what the program wrote to `{out}`, and
+`stdout.txt` and `stderr.txt` its output. Files written anywhere else are not kept. Use results only
+when `fetch` reports **`complete`**; otherwise it names each command that failed. The checkout
+comes from the commit (uncommitted changes are refused), and every result records that commit and
+the hashes of its files.
 
-A sweep file contains one JSON argument list per line, for example:
+## Make a sweep
 
-```json
-["{bin}", "--sets", "64", "--ways", "4", "--trace", "{input:traces/footprint.txt}", "--out", "{out}"]
-["{bin}", "--sets", "64", "--ways", "8", "--trace", "{input:traces/footprint.txt}", "--out", "{out}"]
-```
-
-`{bin}` is your program, `{out}` its output directory, and `{input:...}` a file passed with
-`--input`. See [commands and inputs](docs/running.md#commands-and-inputs) for the full syntax.
-
-## Your own project
+A sweep file holds one command per line, as a JSON argument list:
 
 ```bash
-cd your-simulator
-cloudsweep init --build "make -j" --binary build/mysim   # writes cloudsweep.ini and cloud/Dockerfile
+cat > sweep.jsonl <<'EOF'
+["{bin}", "--seed", "1", "--out", "{out}"]
+["{bin}", "--seed", "2", "--out", "{out}"]
+EOF
+cloudsweep submit --on local --commands sweep.jsonl
 ```
 
-Edit `cloud/Dockerfile` to install your toolchain, commit both files, and continue from
-`cloudsweep image build` as above. [Adapting your project](docs/project.md) covers the options.
+Write large sweeps with a short script, like the example's
+[make_sweep.py](examples/cache-sim/configs/make_sweep.py). `{index}` is the command's number, and
+`--input data/trace.bin` sends a file the commands name as `{input:data/trace.bin}`. Programs run as
+argument lists, without a shell: use `["sh", "-c", "..."]` for shell syntax, and
+`["python3", "simulate.py", "--out", "{out}"]` for a script. See
+[commands and inputs](docs/running.md#commands-and-inputs). The
+[cache simulator example](examples/cache-sim/) is a complete project with a 24-command sweep.
+
+## Run on other machines
+
+Describe each machine once in `~/.config/cloudsweep/machines.ini`: a name, which is also its ssh
+alias, and its kind. A `slurm` machine gets one `sbatch --array` job per sweep, and cloudsweep writes
+the batch script. An `ssh` machine runs a pool of slots: by default one per CPU (one per `[run]
+vcpus` CPUs), or one per GPU set for GPU commands. The partitions and account below are examples;
+use your own.
+
+```ini
+[pembroke2]
+kind = ssh
+
+[ece-gpu]
+kind = slurm
+cpu_sbatch = --partition=defq
+gpu_sbatch = --partition=HGPU
+gpu_type = h100
+
+[deltaai]
+kind = slurm
+sbatch = --account=bbxx-dtai-gh --partition=ghx4
+```
+
+```bash
+cloudsweep doctor --on ece-gpu        # checks what the machine provides
+cloudsweep submit --on ece-gpu --commands sweep.jsonl
+cloudsweep submit --on ece-gpu --commands sweep.jsonl --gpus 1
+```
+
+Commands use the machine's own compilers, modules and Python; `setup` lines load them (a module, or
+`source ~/venvs/sim/bin/activate`). Set `[run] gpus = 1` in `cloudsweep.ini` to make every run of a
+project ask for a GPU. On a machine that needs a password and Duo, such as DeltaAI, you sign in once
+and cloudsweep reuses that connection; [your own machines](docs/machines.md) shows the ssh settings
+and every option.
+
+## Run on AWS
+
+Running many jobs on AWS normally means setting up a cluster or login node, a job queue, a container
+registry, storage and permissions, then logging in to manage them. `cloudsweep deploy` creates all
+of that in one step with your administrator profile. After that, you run `submit`, `status`, `fetch`
+and `cancel` from your own machine under a narrower identity that deploy created, with no console or
+server to log in to. By default that identity borrows your administrator profile's credentials, so
+they must stay valid; with `--identity roles-anywhere` (x86_64 Linux) it uses a certificate that
+lasts a year instead.
+
+Instances run only while there is work, and Batch scales them down after it finishes. A guard checks
+every five minutes. It stops all work when the month's reported spending reaches your cutoff, and it
+stops jobs stuck starting for 30 minutes. It emails you at two spending thresholds, when jobs have
+waited three hours with nothing starting or running, and when instances stay up 30 minutes after the
+work has ended. Confirm the subscription email AWS sends you to receive these.
+
+AWS also needs Docker or Podman and the
+[AWS CLI v2](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html). Edit the
+`cloud/Dockerfile` that `init` wrote to install your toolchain and commit it. These steps create
+**billable resources**; see [deployment](docs/admin.md#deploy) and
+[spending limits](docs/admin.md#costs-and-limits).
+
+```bash
+cloudsweep image build                                # builds and checks the toolchain image
+cloudsweep try --commands sweep.jsonl                 # runs the sweep locally in that image
+cloudsweep deploy --admin-profile <admin profile> --email you@example.org
+cloudsweep image publish
+cloudsweep submit --dry-run --commands sweep.jsonl    # prints the cost estimate
+cloudsweep submit --commands sweep.jsonl              # without --on, submit uses AWS
+cloudsweep fetch <submission> --wait
+```
+
+`cloudsweep status` shows the month's reported spending. `cloudsweep admin retire --admin-profile
+<admin profile> --yes` removes the queue, compute and guard; the bucket and images stay, and are
+billed, until you add `--delete-data` (see [retire](docs/admin.md#retire)).
+
+## Agents
+
+cloudsweep is designed to be run by AI coding agents as well as people. Submitting, watching,
+fetching and cancelling need no administrator rights, and the identity they use on AWS cannot change
+the budget, the spending cutoff or permissions (it does not limit other credentials on your host). When cloudsweep refuses something (cloud use is off, the cutoff
+is active, a run would cost more than the per-run ceiling), it says why and what to do next. If it
+cannot tell whether a submission went through, it records a receipt and never resubmits on its own.
+[For AI agents](docs/agents.md) has instructions to paste into your project.
+
+## When something fails
+
+- `cloudsweep doctor` checks this host and AWS; `cloudsweep doctor --on MACHINE` checks a machine.
+- `cloudsweep status <submission>` counts commands by state, and `fetch` names each one that
+  failed; `cloudsweep cancel <submission>` stops the work.
+- Each attempt's `stderr.txt` is in `cloudsweep-results/<submission>/<command>/<attempt>/` after
+  `fetch`. On a machine, the job's logs are in `<workdir>/jobs/<submission>/logs/` there
+  (`workdir` is `~/cloudsweep` unless you set it).
+- cloudsweep keeps receipts in your project's `.cloudsweep/` (untracked) and, on each machine,
+  builds and results in its `workdir` (`~/cloudsweep`); remove old ones there by hand.
 
 ## Limits
 
-- Independent CPU jobs on On-Demand EC2 only; no GPUs, Spot, or multi-node MPI jobs.
-- Programs must run on Linux for the deployment's architecture: x86_64 or arm64.
+- Independent jobs only, with no multi-node MPI. AWS runs CPU jobs on On-Demand EC2: no GPUs or
+  Spot.
+- Programs must run on Linux, on the target's architecture: x86_64 or arm64.
 - Git submodules are refused; vendor their code into the repository.
-- Output uploads use single requests. Files over 5 GiB and symbolic links are skipped;
-  `fetch` reports the omissions.
-- Spending controls have gaps; the monthly cutoff is not a hard bill limit. See
+- Symbolic links among the outputs are not kept. On AWS, output files over 5 GiB are skipped;
+  `fetch` reports both.
+- AWS spending controls have gaps; the monthly cutoff is not a hard bill limit. See
   [costs and limits](docs/admin.md#costs-and-limits).
 
 ## Documentation
 
-- [Adapting your project](docs/project.md): configuration, Dockerfile, acceptance runs.
-- [Running work](docs/running.md): commands, sizing, results, cancellation.
-- [Administration](docs/admin.md): deployment, costs, identities, cleanup.
+- [Adapting your project](docs/project.md): `cloudsweep.ini`, the Dockerfile, acceptance runs.
+- [Running work](docs/running.md): commands, inputs, sizing, results, cancellation.
+- [Your own machines](docs/machines.md): this host, ssh machines, Slurm clusters, GPUs, Duo.
+- [Administration](docs/admin.md): AWS deployment, costs, identities, cleanup.
 - [How it works](docs/how-it-works.md): lifecycle, verification, permissions.
 - [For AI agents](docs/agents.md): instructions to copy into your project.
 
-Version 0.1.0 is new; the [changelog](CHANGELOG.md) records tested and untested configurations.
-See [Contributing](CONTRIBUTING.md) and [Security](SECURITY.md) for fixes and vulnerability reports.
+The [changelog](CHANGELOG.md) records tested and untested configurations. See
+[Contributing](CONTRIBUTING.md) and [Security](SECURITY.md) for fixes and vulnerability reports.
 Licensed under [Apache-2.0](LICENSE).

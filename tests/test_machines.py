@@ -1,0 +1,378 @@
+"""Sweeps on machines from machines.ini and on this host, end to end: fake ssh runs each remote
+command here (so real rsync works through it), and fake sbatch runs an array's tasks in order,
+as Slurm would."""
+
+import io
+import json
+import os
+import re
+import shutil
+import sys
+import tempfile
+import threading
+import time
+import unittest
+from contextlib import redirect_stdout
+from pathlib import Path
+from unittest import mock
+
+from helpers import PACKAGE, make_repo
+
+from cloudsweep import cli, core, machines, project
+
+sys.path.insert(0, str(PACKAGE))
+import remote  # noqa: E402
+
+INI = """[project]
+name = demo
+[image]
+dockerfile = cloud/Dockerfile
+[build]
+command = mkdir -p build && cp sim.sh build/sim
+binary = build/sim
+[run]
+hours = 0.1
+"""
+SIM = """#!/bin/sh
+# usage: sim OUT INDEX INPUT
+echo "$2 $(cat "$3")" > "$1/result.txt"
+echo "${CUDA_VISIBLE_DEVICES:-none}" > "$1/gpus.txt"
+echo "${FROM_SETUP:-no}" > "$1/setup.txt"
+"""
+MACHINES = """[cluster]
+kind = slurm
+host = fakehost
+workdir = {root}/cluster
+sbatch = --account=acct
+cpu_sbatch = --partition=cpu
+gpu_sbatch = --partition=gpu
+gpu_type = h100
+setup = source cs-setup.sh
+
+[box]
+kind = ssh
+host = fakehost
+workdir = {root}/box
+slots = 2
+
+[gpubox]
+kind = ssh
+host = fakehost
+workdir = {root}/gpubox
+gpus = 2
+
+[broken]
+kind = ssh
+host = fakehost
+workdir = {root}/broken
+setup = false
+"""
+FAKE_SSH = """#!{python}
+import os, sys
+args = sys.argv[1:]
+while args[0].startswith("-"):
+    if args.pop(0) in ("-l", "-p", "-o"):
+        args.pop(0)
+host = args.pop(0)
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write("ssh %s\\n" % host)
+os.chdir(os.environ["HOME"])
+os.execv("/bin/sh", ["/bin/sh", "-c", " ".join(args)])
+"""
+FAKE_SBATCH = """#!{python}
+import json, os, re, subprocess, sys
+flags, script = sys.argv[1:-1], sys.argv[-1]
+text = open(script).read()
+last = int(re.search(r"#SBATCH --array=0-(\\d+)", text).group(1))
+output = re.search(r"#SBATCH --output=(\\S+)", text).group(1)
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write("sbatch %s\\n" % json.dumps(flags))
+for index in range(last + 1):
+    env = dict(os.environ, SLURM_ARRAY_TASK_ID=str(index), SLURM_ARRAY_JOB_ID="4242", SLURM_SUBMIT_DIR=os.getcwd())
+    with open(output.replace("%a", str(index)), "ab") as out:
+        subprocess.run(["/bin/bash", script], env=env, stdout=out, stderr=subprocess.STDOUT)
+print("4242")
+"""
+
+
+class MachineTests(unittest.TestCase):
+    def setUp(self):
+        self.root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(self.root), True)
+        self.repo = self.root / "p"
+        self.commit = make_repo(self.repo, {"cloudsweep.ini": INI, "sim.sh": SIM})
+        (self.repo / "trace.bin").write_text("untracked input")
+        (self.repo / ".cloudsweep").mkdir()
+        (self.repo / ".cloudsweep/machines.ini").write_text(MACHINES.format(root=self.root))
+        self.sweep = self.root / "sweep.jsonl"
+        self.sweep.write_text("".join('["{bin}", "{out}", "%d", "{input:trace.bin}"]\n' % i for i in range(3)))
+        fakes = self.root / "bin"
+        fakes.mkdir()
+        for name, text in (("ssh", FAKE_SSH), ("sbatch", FAKE_SBATCH),
+                           ("squeue", "#!/bin/sh\n"), ("scancel", "#!/bin/sh\necho scancel \"$@\" >> \"$FAKE_LOG\"\n")):
+            (fakes / name).write_text(text.format(python=sys.executable))
+            (fakes / name).chmod(0o755)
+        self.home = self.root / "home"
+        self.home.mkdir()
+        (self.home / "cs-setup.sh").write_text("export FROM_SETUP=yes\n")  # setup paths are relative to home
+        self.log = self.root / "fake.log"
+        environment = {key: value for key, value in os.environ.items()
+                       if key not in ("CUDA_VISIBLE_DEVICES", "XDG_CONFIG_HOME")}
+        environment.update(PATH="%s:%s" % (fakes, os.environ["PATH"]), HOME=str(self.home), FAKE_LOG=str(self.log))
+        patcher = mock.patch.dict(os.environ, environment, clear=True)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+
+    def cli(self, *argv):
+        out, old = io.StringIO(), os.getcwd()
+        os.chdir(str(self.repo))
+        try:
+            with redirect_stdout(out), mock.patch("sys.stderr", io.StringIO()) as err:
+                code = cli.main(list(argv))
+        finally:
+            os.chdir(old)
+        return code, out.getvalue() + err.getvalue()
+
+    def submit(self, machine, *extra, expect=0):
+        code, out = self.cli("submit", "--on", machine, "--commands", str(self.sweep), "--input", "trace.bin", *extra)
+        self.assertEqual(code, expect, out)
+        found = re.search(r"submitted (\S+):", out) or re.search(r"receipt: \S+/(\S+)\.json", out)
+        return found.group(1), out
+
+    def wait_for_pool(self, workdir, submission):
+        state = Path(workdir) / "jobs" / submission / "state.json"
+        for _ in range(120):
+            if state.is_file() and "finished" in json.loads(state.read_text()):
+                return json.loads(state.read_text())
+            time.sleep(0.25)
+        self.fail("the pool did not finish: %s" % (Path(workdir) / "jobs" / submission / "pool.log").read_text())
+
+    def receipt(self, submission):
+        return json.loads((self.repo / ".cloudsweep/receipts" / (submission + ".json")).read_text())
+
+    def test_slurm_sweep_is_one_array_job_and_fetches_verified_results(self):
+        submission, out = self.submit("cluster")
+        self.assertIn("(Slurm job 4242)", out)
+        self.assertIn('sbatch ["--parsable", "--account=acct", "--partition=cpu"]', self.log.read_text())
+        script = (self.root / "cluster/jobs" / submission / "job.sh").read_text()
+        for line in ("#SBATCH --array=0-2", "#SBATCH --time=6", "#SBATCH --signal=B:TERM@120",
+                     "#SBATCH --cpus-per-task=1", "#SBATCH --mem=3500M", "#SBATCH --output=jobs/%s/logs/%%a.txt"
+                     % submission, 'set -e\ncd\nsource cs-setup.sh\ncd "$SLURM_SUBMIT_DIR"\nexec python3 code/'):
+            self.assertIn(line, script)
+        self.assertNotIn("--gpus-per-node", script)
+        code, out = self.cli("status", "--on", "cluster")
+        self.assertIn("%s FINISHED" % submission, out)
+        self.assertIn('"succeeded": 3', out)
+        destination = self.root / "results"
+        code, out = self.cli("fetch", submission, str(destination))  # the receipt names the machine
+        self.assertEqual(code, 0, out)
+        self.assertIn("complete", out)
+        result = destination / submission / "2" / "1" / "out" / "result.txt"
+        self.assertEqual(result.read_text(), "2 untracked input\n")
+        self.assertEqual((result.parent / "setup.txt").read_text(), "yes\n")
+        manifest = json.loads((destination / submission / "submission.json").read_text())
+        self.assertEqual(manifest["machine"], {"name": "cluster", "kind": "slurm", "host": "fakehost"})
+        self.assertTrue(core.DIGEST_RE.fullmatch(manifest["image_digest"]))
+        # A file of your own in the results is not the machine's business; fetching again verifies.
+        (result.parent / "notes.txt").write_text("mine")
+        code, out = self.cli("fetch", submission, str(destination))
+        self.assertEqual(code, 0, out)
+        # A local manifest that no longer matches the machine's is reported, never trusted.
+        manifest_path = destination / submission / "1" / "1" / "manifest.json"
+        changed = json.loads(manifest_path.read_text())
+        changed["exit_code"] = 3
+        manifest_path.write_text(json.dumps(changed))
+        code, out = self.cli("fetch", submission, str(destination))
+        self.assertEqual(code, 1)
+        self.assertIn("child 1: verification failed [1 invalid completion manifest]", out)
+        self.assertIn("exists with different content; not overwritten", out)
+        # The next submission of this commit reuses the build, also from another section's name.
+        again, _ = self.submit("cluster")
+        self.assertFalse(self.receipt(again)["result"]["built"])
+
+    def test_gpu_commands_use_the_gpu_partition(self):
+        code, out = self.cli("submit", "--on", "cluster", "--dry-run", "--gpus", "2", "--commands", str(self.sweep),
+                             "--input", "trace.bin")
+        self.assertEqual(code, 0, out)
+        self.assertIn("#SBATCH --gpus-per-node=h100:2", out)
+        self.assertIn('"--partition=gpu"', out)
+        self.assertNotIn("--partition=cpu", out)
+        self.assertFalse(self.log.exists())  # a dry run contacts nothing
+
+    def test_ssh_pool_runs_commands_in_slots(self):
+        submission, out = self.submit("box")
+        self.assertIn("a pool of 2 slot(s)", out)
+        state = self.wait_for_pool(self.root / "box", submission)
+        self.assertEqual((state["exit_codes"], state["stopped"]), ({"0": 3}, False))
+        code, out = self.cli("status", submission)
+        self.assertIn("%s FINISHED" % submission, out)
+        self.assertIn("not running", self.cli("cancel", submission)[1])  # finished work is left as it is
+        self.assertIn("%s FINISHED" % submission, self.cli("status", submission)[1])
+        (self.root / "box/jobs" / submission / "cancelled").touch()  # a stop that came too late
+        self.assertIn("%s FINISHED" % submission, self.cli("status", submission)[1])
+        destination = self.root / "results"
+        code, out = self.cli("fetch", "--on", "box", submission, str(destination))
+        self.assertEqual(code, 0, out)
+        self.assertEqual((destination / submission / "1/1/out/gpus.txt").read_text(), "none\n")
+
+    def test_this_host_needs_no_settings(self):
+        (self.repo / ".cloudsweep/machines.ini").unlink()
+        submission, out = self.submit("local")
+        self.wait_for_pool(self.home / "cloudsweep", submission)  # the default workdir, ~/cloudsweep
+        self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
+        self.assertFalse(self.log.exists())  # no ssh
+
+    def test_machines_can_be_described_once_per_user(self):
+        user = self.root / "config" / "cloudsweep"
+        user.mkdir(parents=True)
+        (user / "machines.ini").write_text("[shared]\nkind = ssh\nhost = fakehost\nworkdir = shared-work\n")
+        with mock.patch.dict(os.environ, {"XDG_CONFIG_HOME": str(self.root / "config")}):
+            machine = machines.load(self.repo, "shared")
+            self.assertEqual((machine["workdir"], machine["slots"]), ("shared-work", None))
+            submission, _ = self.submit("shared")
+            self.wait_for_pool(self.home / "shared-work", submission)  # relative to the machine's home
+            self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
+
+    def test_gpu_commands_get_one_slot_per_gpu(self):
+        submission, out = self.submit("gpubox", "--gpus", "1")
+        self.assertIn("a pool of 2 slot(s) of 1 GPU(s)", out)
+        self.wait_for_pool(self.root / "gpubox", submission)
+        destination = self.root / "results"
+        self.assertEqual(self.cli("fetch", submission, str(destination))[0], 0)
+        seen = {(destination / submission / str(i) / "1/out/gpus.txt").read_text().strip() for i in range(3)}
+        self.assertEqual(seen, {"0", "1"})
+
+    def test_cancel_stops_the_pool_and_its_commands_upload_what_they_have(self):
+        self.sweep.write_text('["sh", "-c", "sleep 60"]\n' * 4)
+        submission, _ = self.submit("box")
+        started = self.root / "box/store/runs" / submission / "0" / "1" / "started.json"
+        for _ in range(80):
+            if started.is_file():
+                break
+            time.sleep(0.25)
+        self.assertIn('"running": 2', self.cli("status", submission)[1])
+        code, out = self.cli("cancel", submission)
+        self.assertIn("stop requested", out)
+        state = self.wait_for_pool(self.root / "box", submission)
+        self.assertTrue(state["stopped"])
+        self.assertEqual(state["never_started"], 2)
+        self.assertIn("%s CANCELLED" % submission, self.cli("status", "--on", "box")[1])
+        code, out = self.cli("fetch", submission, str(self.root / "results"))
+        self.assertEqual(code, 1)
+        self.assertIn("child 0: terminated", out)
+        self.assertIn("child 3: no attempt yet", out)
+
+    def test_a_submission_that_never_started_is_reported_cancelled_and_fetched(self):
+        submission, out = self.submit("broken", expect=1)  # its setup line fails before anything starts
+        self.assertIn("submit on broken failed", out)
+        self.assertEqual(list((self.root / "broken/builds").glob("*.lock")), [])  # the build lock is released
+        (self.repo / ".cloudsweep/machines.ini").write_text(MACHINES.format(root=self.root).replace("setup = false", ""))
+        self.assertIn("NOT STARTED", self.cli("status", submission)[1])
+        self.assertIn("it will not start", self.cli("cancel", submission)[1])
+        self.assertIn("%s CANCELLED" % submission, self.cli("status", submission)[1])
+        code, out = self.cli("fetch", submission, str(self.root / "results"))
+        self.assertEqual(code, 1, out)
+        self.assertIn("child 0: no attempt yet", out)
+
+    def test_status_reports_submissions_on_several_machines(self):
+        first, _ = self.submit("cluster")
+        second, _ = self.submit("box")
+        self.wait_for_pool(self.root / "box", second)
+        code, out = self.cli("status", first, second)
+        self.assertEqual(code, 0, out)
+        self.assertIn("%s FINISHED" % first, out)
+        self.assertIn("%s FINISHED" % second, out)
+        code, out = self.cli("status", "--json", first, second)
+        self.assertEqual(set(json.loads(out)), {first, second})
+
+    def test_a_concurrent_build_of_the_same_revision_is_waited_for(self):
+        first, _ = self.submit("box")
+        self.wait_for_pool(self.root / "box", first)
+        build = self.root / "box/builds" / self.receipt(first)["build"]
+        record = (build / "build.json").read_bytes()
+        (build / "build.json").unlink()  # as if another submission were still building it
+        lock = Path(str(build) + ".lock")
+        lock.mkdir()
+        (lock / "owner").write_text("20261106T000000Z-aaaaaa\n")
+
+        def finish():
+            time.sleep(1.5)
+            (build / "build.json").write_bytes(record)
+            shutil.rmtree(str(lock))
+        threading.Thread(target=finish).start()
+        second, out = self.submit("box")  # waits for that build, then reuses it
+        self.assertFalse(self.receipt(second)["result"]["built"])
+        self.assertFalse(lock.exists())
+        self.wait_for_pool(self.root / "box", second)
+        self.assertEqual(self.cli("fetch", second, str(self.root / "results"))[0], 0)
+
+    def test_a_lock_is_released_only_by_its_owner_before_its_build_starts(self):
+        machine = machines.load(self.repo, "box")
+        lock = self.root / "box/builds/abc.lock"
+        lock.mkdir(parents=True)
+        (lock / "owner").write_text("20261106T000000Z-bbbbbb\n")
+        machines.release(machine, "abc", "20261106T000000Z-aaaaaa")  # another submission's lock
+        self.assertTrue(lock.exists())
+        (lock / "building").touch()
+        machines.release(machine, "abc", "20261106T000000Z-bbbbbb")  # its build started: the build releases it
+        self.assertTrue(lock.exists())
+        (lock / "building").unlink()
+        machines.release(machine, "abc", "20261106T000000Z-bbbbbb")
+        self.assertFalse(lock.exists())
+
+    def test_settings_are_checked(self):
+        file = self.repo / ".cloudsweep/machines.ini"
+        for text, message in (("[m]\nkind = pbs\n", "kind must be slurm or ssh"),
+                              ("[m]\nkind = slurm\nworkdir = /w/../x\n", "workdir must be a path"),
+                              ("[m]\nkind = slurm\nslots = 2\n", "slots is not a slurm setting"),
+                              ("[m]\nkind = ssh\nslots = 0\n", "slots must be a whole number")):
+            file.write_text(text)
+            with self.assertRaisesRegex(project.Refusal, message):
+                machines.load(self.repo, "m")
+        with self.assertRaisesRegex(project.Refusal, r"no machine \[other\]"):
+            machines.load(self.repo, "other")
+        file.write_text("[m]\nkind = slurm\nworkdir = ~/sweeps\n")
+        self.assertEqual(machines.load(self.repo, "m")["workdir"], "sweeps")
+
+    def test_setup_lines_are_part_of_the_build_identity_and_section_names_are_not(self):
+        machine = machines.load(self.repo, "cluster")
+        recipe = {"command": "make", "binary": None}
+        first = machines.identity(machine, self.commit, recipe)
+        self.assertEqual(first, machines.identity(dict(machine, name="cluster-gpu"), self.commit, recipe))
+        changed = machines.identity(dict(machine, setup=["module load gcc/13"]), self.commit, recipe)
+        self.assertNotEqual(first, changed)
+        self.assertTrue(all(core.DIGEST_RE.fullmatch(digest) for digest in first[:2] + changed[:2]))
+
+
+class RemoteTests(unittest.TestCase):
+    def test_gpus_are_split_into_disjoint_slots(self):
+        job = {"gpus": 2, "machine_gpus": 4, "slots": None}
+        environment = {key: value for key, value in os.environ.items() if key != "CUDA_VISIBLE_DEVICES"}
+        with mock.patch.dict(os.environ, environment, clear=True):
+            self.assertEqual(remote.pool_slots(job), [{"CUDA_VISIBLE_DEVICES": "0,1"}, {"CUDA_VISIBLE_DEVICES": "2,3"}])
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": ""}):  # set but empty: no GPU is visible
+            with self.assertRaisesRegex(ValueError, "this machine has 0"):
+                remote.pool_slots(job)
+        with mock.patch.dict(os.environ, {"CUDA_VISIBLE_DEVICES": "4,6,7"}):
+            self.assertEqual(remote.pool_slots(dict(job, machine_gpus=None)), [{"CUDA_VISIBLE_DEVICES": "4,6"}])
+        with self.assertRaisesRegex(ValueError, "needs 2 GPU"):
+            remote.pool_slots(dict(job, machine_gpus=1))
+        self.assertEqual(remote.pool_slots({"gpus": 0, "slots": 3}), [{}, {}, {}])
+        cpus = len(os.sched_getaffinity(0))
+        self.assertEqual(len(remote.pool_slots({"gpus": 0, "slots": None, "vcpus": 1})), cpus)
+
+    def test_command_states(self):
+        self.assertEqual(remote.child_state(None, "RUNNING", False), "running")
+        self.assertEqual(remote.child_state(remote.NO_ATTEMPT, "PENDING", False), "waiting")
+        self.assertEqual(remote.child_state(None, None, True), "lost (started, no completion manifest)")
+        self.assertEqual(remote.child_state(remote.NO_ATTEMPT, None, True), "waiting")
+        self.assertEqual(remote.child_state("failed", None, False), "failed")
+
+    def test_a_reused_process_id_is_not_taken_for_the_pool(self):
+        site = mock.Mock(submission="20261106T000000Z-aaaaaa")
+        self.assertFalse(remote.pool_alive(site, {"pid": os.getpid(), "pgid": os.getpid()}))
+        self.assertFalse(remote.pool_alive(site, {"pid": os.getpid(), "finished": "now"}))
+
+
+if __name__ == "__main__":
+    unittest.main()

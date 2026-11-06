@@ -1,4 +1,4 @@
-"""cloudsweep: run parameter sweeps on AWS Batch from committed source.
+"""cloudsweep: run parameter sweeps from committed source on AWS Batch or your own machines.
 
 Start with the README quick start. For your own project, run cloudsweep init.
 Use cloudsweep COMMAND --help for options and cloudsweep doctor to diagnose failures.
@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 
-from . import __version__, admin, engine, fetch, image, project, settings, status, submit
+from . import __version__, admin, engine, fetch, image, machines, project, settings, status, submit
 from .project import Refusal
 
 
@@ -47,6 +47,8 @@ def init(args):
 
 def doctor(args):
     """Check each prerequisite and say what to do about the first ones missing."""
+    if args.on:
+        return machines.doctor(args.on)
     rows = []
 
     def row(name, ok, detail):
@@ -126,7 +128,9 @@ def main(argv=None):
     start.add_argument("--build", help="build command, e.g. 'make -j' (default: none)")
     start.add_argument("--binary", help="the program {bin} names, relative to the checkout")
     start.set_defaults(handler=init)
-    commands.add_parser("doctor", help="check prerequisites and the deployment").set_defaults(handler=doctor)
+    check = commands.add_parser("doctor", help="check prerequisites and the deployment, or a machine with --on")
+    check.add_argument("--on", metavar="MACHINE", help="check a machine from machines.ini (or local) instead")
+    check.set_defaults(handler=doctor)
     admin.add_arguments(commands)
     image.add_arguments(commands)
     submit.add_arguments(commands)

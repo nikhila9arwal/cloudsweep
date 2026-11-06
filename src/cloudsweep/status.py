@@ -1,5 +1,6 @@
 """Show jobs, desired capacity and reported monthly spend, which lags usage by hours.
 Works when cloud use is off or the cutoff is active. --storage inventories retained data.
+With --on MACHINE (or submissions whose receipts name one), show that machine's submissions.
 """
 
 import argparse
@@ -7,7 +8,7 @@ import json
 import time
 from decimal import Decimal
 
-from . import core, project, settings
+from . import core, machines, project, settings
 from .project import Refusal
 
 STATUSES = ("SUBMITTED", "PENDING", "RUNNABLE", "STARTING", "RUNNING", "SUCCEEDED", "FAILED")
@@ -152,22 +153,54 @@ def cancel(args):
     return 1 if result.get("errors") else 0
 
 
+def by_machine(args, submissions):
+    """machine name -> submissions: --on, else the machines their receipts name (None is AWS)."""
+    if args.on:
+        return {args.on: list(submissions)}
+    groups = {}
+    for submission in submissions:
+        groups.setdefault(machines.machine_of(project.repository(), submission), []).append(submission)
+    if None in groups and len(groups) > 1:
+        raise Refusal("%s ran on AWS and the others on machines; ask about them separately"
+                      % ", ".join(groups[None]))
+    return groups
+
+
+def route_status(args):
+    if args.on and args.storage:
+        raise Refusal("--storage inventories the AWS bucket; it has no --on form")
+    groups = by_machine(args, args.submissions)
+    if not groups or None in groups:
+        return status(args)
+    return machines.status(args, groups)
+
+
+def route_cancel(args):
+    name = next(iter(by_machine(args, [args.submission] if args.submission else [])), None)
+    return machines.cancel(args, name) if name else cancel(args)
+
+
 def add_arguments(commands):
-    parser = commands.add_parser("status", help="jobs, capacity and reported spend",
+    parser = commands.add_parser("status", help="jobs, capacity and reported spend; or a machine's submissions",
                                  description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("submissions", nargs="*", help="limit to these submissions")
+    parser.add_argument("--on", metavar="MACHINE", help="submissions on a machine from .cloudsweep/machines.ini "
+                        "(default: the machine their receipts name, else AWS)")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     parser.add_argument("--storage", action="store_true", help="inventory retained storage instead of jobs")
-    parser.set_defaults(handler=status)
+    parser.set_defaults(handler=route_status)
 
     stop = commands.add_parser("cancel", help="stop a submission, or all work",
-                               description="Stop jobs in this deployment's queue, including array children.\n"
+                               description="Stop jobs in this deployment's queue, including array children,\n"
+                                           "or with --on a machine's (default: the machine the receipt names).\n"
                                            "Cancellation works when cloud use is off or the cutoff is active.\n"
                                            "Partial output uploads are best effort.",
                                formatter_class=argparse.RawDescriptionHelpFormatter)
     target = stop.add_mutually_exclusive_group(required=True)
     target.add_argument("submission", nargs="?")
-    target.add_argument("--all", action="store_true", help="all work in the queue")
+    target.add_argument("--all", action="store_true", help="all work in the queue (with --on: this checkout's "
+                        "submissions on that machine)")
+    stop.add_argument("--on", metavar="MACHINE", help="a machine from .cloudsweep/machines.ini")
     stop.add_argument("--wait", type=int, default=0, metavar="MINUTES",
-                      help="poll until capacity is zero, at most this long")
-    stop.set_defaults(handler=cancel)
+                      help="poll until capacity is zero (with --on: until the work has stopped), at most this long")
+    stop.set_defaults(handler=route_cancel)

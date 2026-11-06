@@ -8,6 +8,7 @@ Paste this block into your project's agent instructions. The owner configures
 
 Use cloudsweep for long runs or independent sweeps when AWS will finish sooner than local
 compute and `.cloudsweep/deploy.env` has `CLOUDSWEEP_ENABLED=1`. AWS runs cost money.
+`--on MACHINE` runs the same commands on a machine in `.cloudsweep/machines.ini` instead.
 Use `cloudsweep --help` for syntax and `cloudsweep doctor` to diagnose failures.
 
 1. Commit source, then test the command or a few sweep points with `cloudsweep try` locally.

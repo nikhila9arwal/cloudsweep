@@ -33,6 +33,7 @@ binary = build/cachesim      # {bin}; omit if commands name their program direct
 vcpus = 1
 memory_mib = 3500
 hours = 1
+# gpus = 1                   # per command, on your own machines only (docs/machines.md)
 
 [acceptance]                 # optional
 command = ["{bin}", "--accesses", "200000", "--seed", "7", "--out", "{out}"]

@@ -146,6 +146,7 @@ class SubmitTests(unittest.TestCase):
             (("--dry-run", "--hours", "1000", "--", "{bin}"), "two weeks"),
             (("--dry-run", "--memory-mib", "500000", "--", "{bin}"), "no listed instance fits"),
             (("--dry-run", "--hours", "100", "--", "{bin}"), "above the ceiling"),
+            (("--dry-run", "--gpus", "1", "--", "{bin}"), "the AWS queue has no GPU instances"),
         ]
         for argv, message in cases:
             code, _, err = self.submit(*argv)

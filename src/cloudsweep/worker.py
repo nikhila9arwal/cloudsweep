@@ -288,9 +288,10 @@ def run_mode(store, submission, env, work):
     return 128 - code if isinstance(code, int) and code < 0 else (code or 1)
 
 
-def build_mode(work):
+def build_mode(work, writable=True):
     """Inside a revision-image build, as root: run the recipe's command in the clean checkout,
-    then record the commit, the binary's hash and the state of the tracked files."""
+    then record the commit, the binary's hash and the state of the tracked files. On a machine
+    (writable=False) the builder also runs the commands, so the checkout keeps its modes."""
     paths = Paths(work)
     recipe = core.check_recipe(json.loads(paths.recipe.read_text()))
     core.require(run_quiet(["git", "-C", str(paths.src), "status", "--porcelain"]) == "", "the checkout is not clean")
@@ -305,9 +306,10 @@ def build_mode(work):
                      "the build did not produce an executable %s" % recipe["binary"])
         record["binary"] = {"path": str(binary), "sha256": core.sha256_file(binary), "size": binary.stat().st_size}
     paths.record.write_bytes(core.pretty(record))
-    # Jobs run as an unprivileged user and may write inside the checkout (inputs are placed
-    # there). Git tracks only the executable bit, which a+rwX leaves as it was for files.
-    subprocess.run(["chmod", "-R", "a+rwX", str(paths.src)], check=True)
+    if writable:
+        # Jobs run as an unprivileged user and may write inside the checkout (inputs are placed
+        # there). Git tracks only the executable bit, which a+rwX leaves as it was for files.
+        subprocess.run(["chmod", "-R", "a+rwX", str(paths.src)], check=True)
     log("built %s: %s" % (record["commit"], "sha256 %s" % record["binary"]["sha256"] if binary else "no binary"))
     return 0
 

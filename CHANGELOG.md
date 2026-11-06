@@ -1,5 +1,26 @@
 # Changelog
 
+## Unreleased
+
+- `--on MACHINE` runs a sweep on your own machines, in their own environment, through the system
+  ssh and rsync: a Slurm cluster as one `sbatch --array` job (`kind = slurm`), or a machine you ssh
+  into as a pool of slots (`kind = ssh`). `--on local` runs the pool on this host and needs no
+  settings. Machines are described in `~/.config/cloudsweep/machines.ini` or a project's
+  `.cloudsweep/machines.ini`. `status`, `cancel` and `fetch` find a submission's machine in its
+  receipt; `doctor --on MACHINE` checks a machine.
+- `[run] gpus` and `--gpus N`: GPUs per command, on machines (Slurm `--gpus-per-node`, or one pool
+  slot per GPU set). Slurm machines can send CPU and GPU jobs to different partitions and request a
+  GPU type. The AWS queue refuses GPU commands.
+- The file store copies files in blocks instead of reading them whole.
+
+Tested end to end, with fetch reporting complete: a 24-command sweep as an ssh pool on an x86_64
+machine (its system Python 3.6), on this host with `--on local`, and as a Slurm array on the ECE
+cluster's CPU partition (built with its login node's compiler); results were byte-identical across
+the three. A GPU command on the ECE cluster's GPU partition saw exactly the one GPU it asked for.
+On DeltaAI (aarch64, through a ControlMaster connection) the build, submission, status and
+cancellation ran; its GPU command had not yet left the queue. Not yet exercised: `systemd = yes`
+with lingering on, Slurm requeues.
+
 ## 0.1.0 (2026-11-04)
 
 First public version.
