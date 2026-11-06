@@ -25,12 +25,11 @@ Tested end to end, with fetch reporting complete: a 24-command sweep as an ssh p
 machine (its system Python 3.6), on this host with `--on local`, and as a Slurm array on the ECE
 cluster's CPU partition (built with its login node's compiler); results were byte-identical across
 the three. A GPU command on the ECE cluster's GPU partition saw exactly the one GPU it asked for.
-On DeltaAI (aarch64, through a ControlMaster connection) the build, submission, status and
-cancellation ran; its GPU command had not yet left the queue. Not yet exercised: `systemd = yes`
+On DeltaAI (aarch64, through a ControlMaster connection) a GPU command saw exactly one GH200, both
+in the machine's own environment and in an Apptainer image built under QEMU on an x86 host. Not yet exercised: `systemd = yes`
 with lingering on, Slurm requeues. In a container, the 24-command sweep ran on the ECE cluster's
 CPU partition from an image built and converted on the submitting host, with results identical to
-the runs without one; for DeltaAI an arm64 image was built under QEMU there and the revision built
-inside it on DeltaAI's login node.
+the runs without one.
 
 ## 0.1.0 (2026-11-04)
 
