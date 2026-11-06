@@ -63,6 +63,7 @@ on the machine itself, one command per slot. `--on local` is a built-in `ssh` ma
 | `host` | both | ssh alias or host name, or `local` for this host (the section name) |
 | `workdir` | both | directory on the machine for builds, jobs and results; relative paths are under its home directory; on a cluster it must be shared with the compute nodes (`cloudsweep`) |
 | `setup` | both | shell lines run first, in your home directory, one per line: module loads, a venv (none) |
+| `container` | both | `apptainer` runs commands in your project's toolchain image instead ([below](#containers)) (none) |
 | `sbatch`, `cpu_sbatch`, `gpu_sbatch` | slurm | extra `sbatch` options for every job, CPU jobs and GPU jobs: account, partition (none) |
 | `gpu_type` | slurm | GPU type to request, such as `h100` (any) |
 | `slots` | ssh | CPU commands at once (the machine's CPUs ÷ `[run] vcpus`) |
@@ -98,6 +99,27 @@ Commands need no GPU unless `[run] gpus` in `cloudsweep.ini`, or `--gpus N`, ask
 On Slurm, a GPU job adds `gpu_sbatch` and `--gpus-per-node=[gpu_type:]N`, and a CPU job adds
 `cpu_sbatch`. In an ssh pool each GPU command gets its own N GPUs through `CUDA_VISIBLE_DEVICES`.
 The AWS queue has no GPUs and refuses GPU commands.
+
+## Containers
+
+By default commands use the machine's own software. Add `container = apptainer` to a machine's
+section to run them in your project's toolchain image instead: the one `[image]` in
+`cloudsweep.ini` describes for AWS. That pins the compiler and libraries, so a result can match
+across machines and AWS.
+
+The image is built where AWS's is: on this host, with podman or Docker, for the machine's
+architecture. When the architectures differ, as for aarch64 DeltaAI from an x86 workstation, the
+build runs under QEMU emulation (on Ubuntu, `sudo apt install qemu-user-static` provides it). With
+Apptainer installed here, cloudsweep also converts the image to a SIF here; otherwise the machine
+converts the archive it receives. Either way it is uploaded once per image. Only when this host has
+no podman or Docker, or cannot emulate the machine's architecture, does the machine build the image
+itself, with its own podman or Docker.
+
+On the machine, the revision is built inside the image (on a cluster's login node) with the
+checkout at `/work/src`, as on AWS, and each command runs with `apptainer exec`: its copy of the
+checkout at `/work`, the store at `/store`, and the machine's GPUs (`--nv`) for GPU commands. The
+machine needs Apptainer (or Singularity), on a cluster's compute nodes too. If your home directory
+is on a network filesystem, set `CLOUDSWEEP_PODMAN_ROOT` to a local directory.
 
 ## What happens
 

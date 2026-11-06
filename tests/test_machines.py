@@ -95,7 +95,7 @@ print("4242")
 """
 
 
-class MachineTests(unittest.TestCase):
+class MachineFixture(unittest.TestCase):
     def setUp(self):
         self.root = Path(tempfile.mkdtemp())
         self.addCleanup(shutil.rmtree, str(self.root), True)
@@ -150,6 +150,8 @@ class MachineTests(unittest.TestCase):
     def receipt(self, submission):
         return json.loads((self.repo / ".cloudsweep/receipts" / (submission + ".json")).read_text())
 
+
+class MachineTests(MachineFixture):
     def test_slurm_sweep_is_one_array_job_and_fetches_verified_results(self):
         submission, out = self.submit("cluster")
         self.assertIn("(Slurm job 4242)", out)
@@ -311,13 +313,13 @@ class MachineTests(unittest.TestCase):
         lock = self.root / "box/builds/abc.lock"
         lock.mkdir(parents=True)
         (lock / "owner").write_text("20261106T000000Z-bbbbbb\n")
-        machines.release(machine, "abc", "20261106T000000Z-aaaaaa")  # another submission's lock
+        machines.release(machine, "builds/abc", "20261106T000000Z-aaaaaa")  # another submission's lock
         self.assertTrue(lock.exists())
         (lock / "building").touch()
-        machines.release(machine, "abc", "20261106T000000Z-bbbbbb")  # its build started: the build releases it
+        machines.release(machine, "builds/abc", "20261106T000000Z-bbbbbb")  # its build started: the build releases it
         self.assertTrue(lock.exists())
         (lock / "building").unlink()
-        machines.release(machine, "abc", "20261106T000000Z-bbbbbb")
+        machines.release(machine, "builds/abc", "20261106T000000Z-bbbbbb")
         self.assertFalse(lock.exists())
 
     def test_settings_are_checked(self):
@@ -342,6 +344,101 @@ class MachineTests(unittest.TestCase):
         changed = machines.identity(dict(machine, setup=["module load gcc/13"]), self.commit, recipe)
         self.assertNotEqual(first, changed)
         self.assertTrue(all(core.DIGEST_RE.fullmatch(digest) for digest in first[:2] + changed[:2]))
+
+
+FAKE_APPTAINER = """#!{python}
+import os, shutil, sys
+args = sys.argv[1:]
+if args[0] == "build":  # a SIF is a copy of the archive here
+    shutil.copyfile(args[-1].split("://", 1)[1], args[-2])
+    sys.exit(0)
+index, binds, env, clean = 1, {{}}, {{}}, False
+while args[index].startswith("--"):
+    flag = args[index]
+    index += 1
+    if flag in ("--bind", "--env"):
+        key, value = args[index].split(":" if flag == "--bind" else "=", 1)
+        (binds.__setitem__(value, key) if flag == "--bind" else env.__setitem__(key, value))
+        index += 1
+    clean = clean or flag == "--cleanenv"
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write("apptainer exec %s\\n" % " ".join(sorted(binds)))
+command = args[index + 1:]
+base = {{key: os.environ[key] for key in ("PATH", "FAKE_LOG", "FAKE_WORKER")}} if clean else dict(os.environ)
+base.update(env)
+if "/work" in binds:  # the container's paths, as host paths
+    base["CLOUDSWEEP_WORK"] = binds["/work"]
+if base.get("CLOUDSWEEP_STORE") == "file:///store":
+    base["CLOUDSWEEP_STORE"] = "file://" + binds["/store"]
+if command[:2] == ["python3", "/opt/cloudsweep/worker.py"]:
+    command = [sys.executable, os.environ["FAKE_WORKER"]] + command[2:]
+os.execvpe(command[0], command, base)
+"""
+FAKE_PODMAN = """#!/bin/sh
+prev=""
+for arg; do [ "$prev" = "-o" ] && echo archive > "$arg"; prev="$arg"; done
+echo "podman $*" | cut -c1-60 >> "$FAKE_LOG"
+"""
+
+
+class ContainerTests(MachineFixture):
+    """container = apptainer: the image built here (mocked engine), converted here or on the machine,
+    or built on the machine; the revision built and every command run through apptainer exec."""
+
+    def setUp(self):
+        super().setUp()
+        fakes = self.root / "bin"
+        for name, text in (("apptainer", FAKE_APPTAINER), ("podman", FAKE_PODMAN)):
+            (fakes / name).write_text(text.format(python=sys.executable))
+            (fakes / name).chmod(0o755)
+        os.environ["FAKE_WORKER"] = str(PACKAGE / "worker.py")
+        (self.repo / "cloud").mkdir()  # the working tree's [image] Dockerfile, as `image build` reads it
+        (self.repo / "cloud/Dockerfile").write_text("FROM docker.io/library/debian:bookworm-slim\n")
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("\n[ctr]\nkind = slurm\nhost = fakehost\nworkdir = %s/ctr\ncontainer = apptainer\n" % self.root)
+
+    def built_here(self):
+        def save(*args, **kwargs):
+            Path(args[list(args).index("-o") + 1]).write_text("archive")
+        return [mock.patch.object(machines, "builds_here", return_value=True),
+                mock.patch.object(machines.engine, "build_base", return_value="sha256:" + "c" * 64),
+                mock.patch.object(machines.engine, "engine_name", return_value="podman"),
+                mock.patch.object(machines.engine, "engine", side_effect=save),
+                mock.patch("cloudsweep.image.checks")]
+
+    def run_sweep(self, patches):
+        for patcher in patches:
+            patcher.start()
+            self.addCleanup(patcher.stop)
+        submission, out = self.submit("ctr")
+        destination = self.root / "results"
+        code, out = self.cli("fetch", submission, str(destination))
+        self.assertEqual(code, 0, out)
+        self.assertEqual((destination / submission / "2/1/out/result.txt").read_text(), "2 untracked input\n")
+        job = json.loads((self.root / "ctr/jobs" / submission / "job.json").read_text())
+        log = self.log.read_text()
+        self.assertIn("apptainer exec /work\n", log)          # the revision's build, in the image
+        self.assertIn("apptainer exec /store /work\n", log)   # each command, in the image
+        return job, self.root / "ctr/images" / job["container"]["key"], log
+
+    def test_the_image_is_built_and_converted_here(self):
+        job, images, log = self.run_sweep(self.built_here())
+        self.assertEqual(job["container"]["key"], "c" * 16)
+        self.assertTrue((images / "base.sif").is_file())
+        self.assertFalse((images / "base.tar").exists())
+        self.assertNotIn("podman", log)
+
+    def test_the_machine_converts_when_this_host_has_no_apptainer(self):
+        which = lambda name: None if name in ("apptainer", "singularity") else shutil.which(name)
+        job, images, _ = self.run_sweep(self.built_here() + [mock.patch.object(machines.shutil, "which", which)])
+        self.assertTrue((images / "base.sif").is_file())
+        self.assertFalse((images / "base.tar").exists())
+
+    def test_the_machine_builds_the_image_only_when_this_host_cannot(self):
+        job, images, log = self.run_sweep([mock.patch.object(machines, "builds_here", return_value=False)])
+        self.assertIn("podman", log)                 # built on the machine, with its podman
+        self.assertTrue((images / "context").is_dir())
+        self.assertTrue((images / "base.sif").is_file())
 
 
 class RemoteTests(unittest.TestCase):

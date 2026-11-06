@@ -18,6 +18,11 @@ cloudsweep fetch <submission> --wait                          # verified results
 You need Python 3.9+, Git and rsync. `--on local` needs Linux; from macOS you can run on other
 machines and AWS. Each machine you run on needs bash, git, rsync and Python 3.6+.
 
+To run commands on a machine in your toolchain image instead (`container = apptainer`), you also
+need Podman or Docker here, Apptainer on the machine, and preferably Apptainer here too. For a machine
+of another architecture, such as aarch64 DeltaAI from an x86 host, you need QEMU emulation here
+(`sudo apt install qemu-user-static`).
+
 ```bash
 git clone https://github.com/nikhila9arwal/cloudsweep
 python3 -m venv .venv
@@ -96,7 +101,9 @@ cloudsweep submit --on ece-gpu --commands sweep.jsonl --gpus 1
 ```
 
 Commands use the machine's own compilers, modules and Python; `setup` lines load them (a module, or
-`source ~/venvs/sim/bin/activate`). Set `[run] gpus = 1` in `cloudsweep.ini` to make every run of a
+`source ~/venvs/sim/bin/activate`). To run in your toolchain image instead, as on AWS, add
+`container = apptainer`: cloudsweep builds the image on this host and sends it
+([containers](docs/machines.md#containers)). Set `[run] gpus = 1` in `cloudsweep.ini` to make every run of a
 project ask for a GPU. On a machine that needs a password and Duo, such as DeltaAI, you sign in once
 and cloudsweep reuses that connection; [your own machines](docs/machines.md) shows the ssh settings
 and every option.

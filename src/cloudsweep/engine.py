@@ -76,7 +76,11 @@ def engine(*args, **kwargs):
         root.mkdir(mode=0o700, parents=True, exist_ok=True)
         argv += ["--root", str(root / "storage"), "--runroot", str(root / "run"),
                  "--storage-opt", "overlay.ignore_chown_errors=true"]
-        env["REGISTRY_AUTH_FILE"] = str(root / "auth.json")
+        auth = root / "auth.json"
+        if not auth.exists():  # podman 3 refuses an auth file that does not exist yet
+            auth.write_text("{}\n")
+            auth.chmod(0o600)
+        env["REGISTRY_AUTH_FILE"] = str(auth)
     if name == "docker":
         env.setdefault("BUILDX_NO_DEFAULT_ATTESTATIONS", "1")  # push a plain image, not an index
     kwargs.setdefault("check", True)
@@ -90,9 +94,8 @@ def image_id(image):
 
 
 def build(context, tag, dockerfile=None, platform=None):
+    # Both engines pull a base image only when it is missing; podman 3 rejects --pull=missing.
     args = ["build", "-t", tag]
-    if engine_name() == "podman":
-        args.append("--pull=missing")
     if dockerfile:
         args += ["-f", str(dockerfile)]
     if platform:

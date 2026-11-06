@@ -11,7 +11,12 @@
 - `[run] gpus` and `--gpus N`: GPUs per command, on machines (Slurm `--gpus-per-node`, or one pool
   slot per GPU set). Slurm machines can send CPU and GPU jobs to different partitions and request a
   GPU type. The AWS queue refuses GPU commands.
+- `container = apptainer` runs a machine's commands in the project's toolchain image, as on AWS. The
+  image is built on the submitting host with podman or Docker (under QEMU for another architecture),
+  converted to a SIF there when Apptainer is installed, and uploaded once; the machine converts or
+  builds it only when the submitting host cannot.
 - The file store copies files in blocks instead of reading them whole.
+- Image builds work with podman 3 (Ubuntu 22.04): no `--pull=missing`, and the auth file is created.
 
 Tested end to end, with fetch reporting complete: a 24-command sweep as an ssh pool on an x86_64
 machine (its system Python 3.6), on this host with `--on local`, and as a Slurm array on the ECE
@@ -19,7 +24,10 @@ cluster's CPU partition (built with its login node's compiler); results were byt
 the three. A GPU command on the ECE cluster's GPU partition saw exactly the one GPU it asked for.
 On DeltaAI (aarch64, through a ControlMaster connection) the build, submission, status and
 cancellation ran; its GPU command had not yet left the queue. Not yet exercised: `systemd = yes`
-with lingering on, Slurm requeues.
+with lingering on, Slurm requeues. In a container, the 24-command sweep ran on the ECE cluster's
+CPU partition from an image built and converted on the submitting host, with results identical to
+the runs without one; for DeltaAI an arm64 image was built under QEMU there and the revision built
+inside it on DeltaAI's login node.
 
 ## 0.1.0 (2026-11-04)
 

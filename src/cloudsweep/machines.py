@@ -19,12 +19,16 @@ does from AWS.
 """
 
 import configparser
+import hashlib
 import json
 import os
+import platform
 import re
 import shlex
+import shutil
 import socket
 import subprocess
+import sys
 import tempfile
 import time
 from pathlib import Path
@@ -33,7 +37,7 @@ from . import core, engine, fetch, project, settings
 from .project import Refusal
 
 FILE = "machines.ini"
-COMMON = {"kind", "host", "workdir", "setup"}
+COMMON = {"kind", "host", "workdir", "setup", "container"}
 KEYS = {"slurm": COMMON | {"sbatch", "cpu_sbatch", "gpu_sbatch", "gpu_type"},
         "ssh": COMMON | {"slots", "gpus", "systemd"}}
 GPU_TYPE_RE = re.compile(r"[A-Za-z0-9_.-]+")
@@ -46,6 +50,8 @@ REMOTE_FILES = ("remote.py", "worker.py", "core.py")
 RESULT = "CLOUDSWEEP-RESULT "
 MISSING_CODE = 97  # remote exit status: this version of cloudsweep's code is not in workdir yet
 ACTIVE = ("PENDING", "RUNNING")
+PLATFORM_OF = {"x86_64": "linux/amd64", "amd64": "linux/amd64", "aarch64": "linux/arm64", "arm64": "linux/arm64"}
+QEMU = {"linux/amd64": "qemu-x86_64", "linux/arm64": "qemu-aarch64"}  # binfmt_misc entries for emulated builds
 SIGNAL_SECONDS = 120  # Slurm sends SIGTERM this long before the time limit, so the worker can upload
 
 
@@ -95,7 +101,10 @@ def machine(name, section, where):
                       "the machine's home directory)" % where)
     if host == LOCAL and not workdir.startswith("/"):
         workdir = str(Path.home() / workdir)
-    result = {"name": name, "kind": kind, "host": host, "workdir": workdir,
+    container = section.get("container", "").strip().lower() or None
+    if container not in (None, "apptainer", "singularity"):
+        raise Refusal("%s: container must be apptainer (or left out to run in the machine's own environment)" % where)
+    result = {"name": name, "kind": kind, "host": host, "workdir": workdir, "container": container and "apptainer",
               "setup": [line.strip() for line in section.get("setup", "").splitlines() if line.strip()]}
     if kind == "slurm":
         for key in ("sbatch", "cpu_sbatch", "gpu_sbatch"):
@@ -124,16 +133,76 @@ def number(section, key, where, least):
     return value
 
 
-def identity(machine, commit, recipe):
-    """Synthetic sha256 digests in place of container images: the machine's environment (its
-    host and setup lines), and the revision built in it. Returns them with the build directory's
-    name; sections for the same host and setup share builds."""
+def identity(machine, commit, recipe, image=None):
+    """Synthetic sha256 digests in place of AWS's registry digests: the machine's environment (its
+    host, setup lines and container image, if any), and the revision built in it. Returns them with
+    the build directory's name; sections for the same host and setup share builds."""
     host = machine["host"] if machine["host"] != LOCAL else "local:" + socket.gethostname()
     environment = "sha256:" + core.sha256_bytes(json.dumps({"schema": core.SCHEMA, "host": host,
-                                                            "setup": machine["setup"]},
+                                                            "setup": machine["setup"], "image": image},
                                                            sort_keys=True, separators=(",", ":")).encode())
     key = core.build_key(commit, environment, recipe)
     return environment, "sha256:" + key, key[:16]
+
+
+def builds_here(target):
+    """Whether this host can build images for target: a container engine and the same
+    architecture, or emulation for the other (QEMU's binfmt entry on Linux; Docker Desktop and
+    podman machine provide it elsewhere)."""
+    try:
+        engine.engine_name()
+    except Refusal:
+        return False
+    if platform.system() != "Linux":
+        return True
+    return target == PLATFORM_OF.get(platform.machine()) or Path("/proc/sys/fs/binfmt_misc", QEMU[target]).exists()
+
+
+def prepare_image(repo, target):
+    """The machine's container image, from the working tree's [image] settings as for AWS: the
+    toolchain Dockerfile with cloudsweep's worker layer. Built and checked here when this host can
+    build for the machine's architecture; otherwise only identified, for the machine to build."""
+    from . import image as images  # image imports submit, which imports this module
+    config = project.load(repo)
+    spec, name = dict(project.image(config, repo), platform=target), project.name(config)
+    if builds_here(target):
+        tag = "localhost/%s-base:%s" % (name, target.split("/")[1])
+        print("cloudsweep: building the container image for %s here (reused until the toolchain changes)"
+              % target, file=sys.stderr, flush=True)
+        image_id = engine.build_base(spec, name, tag)
+        images.checks(spec, tag)
+        return {"key": image_id.split(":", 1)[1][:16], "tag": tag, "spec": spec}
+    digest = hashlib.sha256(json.dumps([target, engine.WORKER_LAYER, spec["check"]]).encode())
+    for path in [spec["dockerfile"]] + sorted(Path(spec["context"]).rglob("*")) + \
+            [engine.HERE / file for file in engine.WORKER_FILES]:
+        if Path(path).is_file():
+            digest.update(str(path).encode() + b"\0" + Path(path).read_bytes())
+    return {"key": digest.hexdigest()[:16], "tag": None, "spec": spec}
+
+
+def stage_image(tree, image):
+    """What the machine needs to have the image: a SIF converted here when this host has apptainer,
+    else a docker archive it converts; or, when this host could not build it, the recipe."""
+    directory = tree / "images" / image["key"]
+    directory.mkdir(parents=True)
+    if image["tag"] is None:
+        shutil.copytree(str(image["spec"]["context"]), str(directory / "context"), symlinks=True)
+        shutil.copy2(str(image["spec"]["dockerfile"]), str(directory / "Dockerfile"))
+        (directory / "worker").mkdir()
+        for file in engine.WORKER_FILES:
+            shutil.copy2(str(engine.HERE / file), str(directory / "worker" / file))
+        (directory / "worker" / "Dockerfile").write_text(engine.WORKER_LAYER.format(
+            toolchain="localhost/cloudsweep-%s-toolchain:latest" % image["key"], work=core.WORK))
+        return
+    archive = directory / "base.tar"
+    engine.engine("save", *(["--format", "docker-archive"] if engine.engine_name() == "podman" else []),
+                  "-o", str(archive), image["tag"], stdout=subprocess.DEVNULL)
+    runtime = shutil.which("apptainer") or shutil.which("singularity")
+    if runtime:
+        print("cloudsweep: converting the image to a SIF here", file=sys.stderr, flush=True)
+        subprocess.run([runtime, "build", str(directory / "base.sif"), "docker-archive://" + str(archive)],
+                       check=True, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL)  # errors still show
+        archive.unlink()
 
 
 def code_files():
@@ -242,7 +311,14 @@ def submit(args, prepare):
         commit, recipe, files_in, commands, hours, vcpus, memory_mib, gpus = prepare(args, repo)
         if machine["kind"] == "ssh" and gpus and machine["gpus"] == 0:
             raise Refusal("these commands need GPUs; [%s] sets gpus = 0" % machine["name"])
-        environment, digest, build = identity(machine, commit, recipe)
+        image = None
+        if machine["container"]:
+            arch = ssh(machine, "uname -m").stdout.split()
+            target = PLATFORM_OF.get(arch[-1] if arch else "")
+            if not target:
+                raise Refusal("cannot tell %s's architecture (uname -m printed %r)" % (machine["name"], arch))
+            image = prepare_image(repo, target)
+        environment, digest, build = identity(machine, commit, recipe, image and image["key"])
         submission = core.new_submission_id()
         inputs = {name: core.sha256_file(file) for name, file in sorted(files_in.items())}
         manifest = core.submission_manifest(
@@ -253,11 +329,16 @@ def submit(args, prepare):
                "commit": commit, "build": build, "image_digest": digest, "count": len(commands),
                "seconds": core.timeout_seconds(hours), "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus,
                "setup": machine["setup"]}
+        if image:
+            job["container"] = {"key": image["key"], "check": None if image["tag"] else image["spec"]["check"]}
         workdir, script = machine["workdir"], None
         plan = {"submission": submission, "machine": machine["name"], "kind": machine["kind"],
                 "host": machine["host"], "workdir": workdir, "commit": commit, "children": len(commands),
                 "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus, "hours": str(hours), "build": build,
                 "image_digest": digest}
+        if image:
+            plan["container"] = "apptainer, image %s built %s" % (image["key"], "here" if image["tag"] else
+                                                                  "on the machine (this host cannot build for it)")
         if machine["kind"] == "slurm":
             job.update(sbatch=machine["sbatch"] + machine["gpu_sbatch" if gpus else "cpu_sbatch"],
                        gpu_type=machine["gpu_type"])
@@ -274,24 +355,25 @@ def submit(args, prepare):
             return 0
         # The build is reused when there; otherwise the submission that takes builds/KEY.lock
         # uploads the checkout and builds it, and a concurrent one waits for that build.
-        probe = ssh(machine, "set -e; umask 077; mkdir -p {w}/builds {w}/jobs {w}/store/inputs {w}/store/runs; "
-                             "if [ -f {w}/builds/{b}/build.json ]; then echo built; "
-                             "elif mkdir {w}/builds/{b}.lock 2>/dev/null; then echo {s} > {w}/builds/{b}.lock/owner; "
-                             "rm -rf {w}/builds/{b}; echo new; else echo busy; fi".format(w=workdir, b=build,
-                                                                                         s=submission))
-        state = (probe.stdout.split() or [""])[-1]
-        if probe.returncode or state not in ("built", "new", "busy"):
+        # Each of the build and the image is reused when there; otherwise the submission that takes
+        # its lock uploads what makes it, and a concurrent one waits for it.
+        locks = ["builds/" + build] + (["images/" + image["key"]] if image else [])
+        probe = ssh(machine, "set -e; umask 077; mkdir -p {w}/builds {w}/images {w}/jobs {w}/store/inputs "
+                             "{w}/store/runs\n".format(w=workdir) + "\n".join(
+            "if [ -f {w}/{d}/{f} ]; then echo built; elif mkdir {w}/{d}.lock 2>/dev/null; then echo {s} > "
+            "{w}/{d}.lock/owner; rm -rf {w}/{d}; echo new; else echo busy; fi".format(
+                w=workdir, d=lock, f="build.json" if lock.startswith("builds") else "base.sif", s=submission)
+            for lock in locks))
+        states = probe.stdout.split()[-len(locks):]
+        if probe.returncode or len(states) != len(locks) or not set(states) <= {"built", "new", "busy"}:
             raise Refusal("could not prepare %s on %s (exit %d)" % (workdir, machine["name"], probe.returncode))
         try:
             path, receipt = stage(machine, repo, manifest, commands, job, script, files_in, inputs, files_code,
-                                  state, dict(plan, label=args.label))
-        except BaseException:
-            release(machine, build, submission)
-            raise
-        try:
+                                  states[0], dict(plan, label=args.label), image if states[1:] == ["new"] else None)
             result = call(machine, "submit", submission)
         except BaseException:
-            release(machine, build, submission)
+            for lock in locks:
+                release(machine, lock, submission)
             raise
         receipt.update(result=result, submission_state="cancelled" if result.get("cancelled") else "submitted")
         settings.write_receipt(path.parent, receipt, replace=True)
@@ -321,10 +403,10 @@ def submit(args, prepare):
     return 0
 
 
-def release(machine, build, submission):
-    """Release the build lock if this submission holds it and no build took it up (a build that
-    starts marks the lock and releases it itself); best effort."""
-    lock = "%s/builds/%s.lock" % (machine["workdir"], build)
+def release(machine, made, submission):
+    """Release the lock on made (builds/KEY or images/KEY) if this submission holds it and nothing
+    took it up (making starts by marking the lock, and releases it itself); best effort."""
+    lock = "%s/%s.lock" % (machine["workdir"], made)
     try:
         ssh(machine, '[ "$(cat {l}/owner 2>/dev/null)" = {s} ] && [ ! -e {l}/building ] && rm -rf {l}; true'
             .format(l=lock, s=submission))
@@ -332,9 +414,10 @@ def release(machine, build, submission):
         pass
 
 
-def stage(machine, repo, manifest, commands, job, script, files_in, inputs, files_code, state, plan):
+def stage(machine, repo, manifest, commands, job, script, files_in, inputs, files_code, state, plan, image=None):
     """Upload the remote code, the submission's records, its job, its inputs (by content digest, as
-    on AWS) and, when this submission builds, the checkout; then write the receipt."""
+    on AWS), the checkout when this submission builds it and the image when it makes that; then
+    write the receipt."""
     submission, workdir, build = job["submission"], machine["workdir"], job["build"]
     with tempfile.TemporaryDirectory(prefix="cloudsweep-") as scratch:
         tree = Path(scratch) / "tree"
@@ -353,6 +436,8 @@ def stage(machine, repo, manifest, commands, job, script, files_in, inputs, file
             (tree / "builds" / build).mkdir(parents=True)
             engine.checkout(repo, job["commit"], tree / "builds" / build / "src")
             (tree / "builds" / build / core.RECIPE).write_bytes(core.pretty(manifest["recipe"]))
+        if image:
+            stage_image(tree, image)
         rsync("-a", str(tree) + "/", at(machine, workdir + "/"))
         if inputs:  # ones already there are not sent again
             links = Path(scratch) / "inputs"
@@ -509,7 +594,8 @@ def doctor(name):
     print("%-10s ok   %s: %s via %s, workdir %s" % ("machine", name, machine["kind"],
                                                      "this host" if machine["host"] == LOCAL else "ssh " + machine["host"],
                                                      machine["workdir"]), flush=True)
-    result = call(machine, "check", machine["kind"], "1" if machine["kind"] == "ssh" and machine["gpus"] else "0")
+    result = call(machine, "check", machine["kind"], "1" if machine["kind"] == "ssh" and machine["gpus"] else "0",
+                  "1" if machine["container"] else "0")
     rows = [("reached", True, result["host"])] + [tuple(row) for row in result["rows"]]
     for label, ok, detail in rows:
         print("%-10s %s  %s" % (label, "ok " if ok else "-- ", detail))

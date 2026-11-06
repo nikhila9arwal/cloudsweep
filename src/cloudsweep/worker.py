@@ -351,8 +351,8 @@ def main(argv=None):
     work = os.environ.get("CLOUDSWEEP_WORK", core.WORK)
     if args == ["check"]:
         return check_mode()
-    if args == ["build"]:
-        return build_mode(work)
+    if args in (["build"], ["build", "--keep-modes"]):  # --keep-modes: built and run by one user
+        return build_mode(work, writable=args == ["build"])
     if len(args) != 2 or args[0] != "run" or not core.SUBMISSION_RE.fullmatch(args[1]):
         print(__doc__, file=sys.stderr)
         return 2

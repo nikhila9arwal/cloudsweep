@@ -8,6 +8,7 @@ its setup lines. It needs python3 >= 3.6 and git. WORKDIR may be relative to the
 WORKDIR holds:
   store/            the file:// store: submissions, inputs and every attempt's results
   builds/KEY/       a revision built on this machine (KEY names the commit, recipe and setup)
+  images/KEY/       base.sif, when the machine runs commands in a container (container = apptainer)
   jobs/SUBMISSION/  job.json and job.sh (written by cloudsweep), state.json, logs/INDEX.txt
   code/HASH/        these three files
 
@@ -109,35 +110,135 @@ def lock_owner(lock):
         return None
 
 
-def build(site):
-    """Build the revision once in this machine's environment; later submissions reuse it. The
-    submission that took builds/KEY.lock when cloudsweep prepared workdir uploaded the checkout
-    and builds it; a concurrent one waits for that build. A revision is built where it runs,
-    since programs may depend on where they were built, so it is never built aside and moved."""
-    record, lock = site.build / "build.json", site.root / "builds" / (site.job["build"] + ".lock")
-    if not record.is_file() and lock_owner(lock) != site.submission:
-        print("cloudsweep: submission %s is building this revision; waiting (remove %s if nothing is building)"
-              % (lock_owner(lock), lock), file=sys.stderr, flush=True)
+def my_turn(site, lock, made, what):
+    """Whether this submission makes `what` (it took lock when cloudsweep prepared workdir and
+    uploaded what it needs); a concurrent one waits, then finds it made. Marks the lock once
+    making starts, so cloudsweep never releases a lock a maker holds."""
+    if not made.exists() and lock_owner(lock) != site.submission:
+        print("cloudsweep: submission %s is making %s; waiting (remove %s if nothing is)" % (
+            lock_owner(lock), what, lock), file=sys.stderr, flush=True)
         deadline = time.monotonic() + 3 * 3600
         while lock.exists() and time.monotonic() < deadline:
             time.sleep(5)
-    if record.is_file():
+    if made.exists():
+        if lock_owner(lock) == site.submission:  # cloudsweep sent it already made (a SIF converted there)
+            shutil.rmtree(str(lock), ignore_errors=True)
         return False
-    core.require(lock_owner(lock) == site.submission, "the other build of this revision did not finish (see %s); "
-                 "submit again" % (site.build / "build.log"))
+    core.require(lock_owner(lock) == site.submission, "the other submission's %s did not finish; submit again" % what)
     (lock / "building").touch()
+    return True
+
+
+def apptainer():
+    found = shutil.which("apptainer") or shutil.which("singularity")
+    core.require(found, "container = apptainer, but this machine has neither apptainer nor singularity")
+    return found
+
+
+def image_path(site):
+    return site.root / "images" / site.job["container"]["key"] / "base.sif"
+
+
+def in_container(site, binds, env, image=None):
+    """The image's worker under apptainer exec, as Batch runs it: only these variables, these
+    directories bound in, and the host's GPUs (--nv) for GPU commands."""
+    argv = [apptainer(), "exec", "--cleanenv", "--no-home"]
+    for source, target in binds:
+        argv += ["--bind", "%s:%s" % (source, target)]
+    if site.job["gpus"]:
+        argv.append("--nv")
+    for name, value in sorted(env.items()):
+        argv += ["--env", "%s=%s" % (name, value)]
+    return argv + [str(image or image_path(site)), "python3", "/opt/cloudsweep/worker.py"]
+
+
+def stream(argv, log, **kwargs):
+    """Run argv with its output in log and on stderr (which ssh carries to the submitting host)."""
+    with open(str(log), "ab") as out:
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                   stderr=subprocess.STDOUT, **kwargs)
+        for line in process.stdout:
+            out.write(line)
+            sys.stderr.buffer.write(line)
+            sys.stderr.flush()
+        return process.wait()
+
+
+def ensure_image(site):
+    """The SIF commands run in, made once per image: converted from the docker archive cloudsweep
+    built and sent, or, when the submitting host could not build for this machine, built here
+    from the Dockerfile it sent. Returns whether this submission made it."""
+    sif = image_path(site)
+    lock = sif.parent.parent / (sif.parent.name + ".lock")
+    if not my_turn(site, lock, sif, "the container image"):
+        return False
+    log, part = sif.parent / "image.log", sif.parent / "base.sif.part"
+    try:
+        archive = sif.parent / "base.tar"
+        if not archive.exists():
+            archive = build_image(site, sif.parent, log)
+        print("cloudsweep: converting the image to %s (once per image)" % sif, file=sys.stderr, flush=True)
+        code = stream([apptainer(), "build", "--force", str(part), "docker-archive://" + str(archive)], log)
+        core.require(code == 0, "apptainer build failed (exit %d); its log is %s" % (code, log))
+        check = site.job["container"].get("check")
+        if check:  # an image built on the submitting host was checked there
+            code = stream([apptainer(), "exec", str(part), "/bin/sh", "-c", check], log)
+            core.require(code == 0, "the toolchain check failed in the image: %s" % check)
+        os.replace(str(part), str(sif))
+        archive.unlink()
+    finally:
+        shutil.rmtree(str(lock), ignore_errors=True)
+    return True
+
+
+def build_image(site, directory, log):
+    """The last resort: build the image on this machine, with its podman or docker, from the
+    toolchain Dockerfile and worker layer cloudsweep sent; returns a docker archive of it."""
+    engine = shutil.which("podman") or shutil.which("docker")
+    core.require(engine, "the submitting host could not build the image for this machine, and this machine has "
+                 "neither podman nor docker to build it")
+    base = [engine]
+    if os.path.basename(engine) == "podman":  # storage on local disk, as cloudsweep uses it
+        root = Path(tempfile.gettempdir()) / ("cloudsweep-podman-%d" % os.getuid())
+        base += ["--root", str(root / "storage"), "--runroot", str(root / "run"),
+                 "--storage-opt", "overlay.ignore_chown_errors=true"]
+    spec, archive = site.job["container"], directory / "base.tar"
+    toolchain, tag = "localhost/cloudsweep-%s-toolchain:latest" % spec["key"], "localhost/cloudsweep-%s:latest" % spec["key"]
+    print("cloudsweep: building the container image here, since the submitting host could not",
+          file=sys.stderr, flush=True)
+    for argv in (base + ["build", "-t", toolchain, "-f", str(directory / "Dockerfile"), str(directory / "context")],
+                 base + ["build", "-t", tag, str(directory / "worker")],
+                 base + ["save"] + (["--format", "docker-archive"] if os.path.basename(engine) == "podman" else [])
+                 + ["-o", str(archive), tag]):
+        code = stream(argv, log)
+        core.require(code == 0, "%s failed (exit %d); its log is %s" % (" ".join(argv[:2]), code, log))
+    run(base + ["rmi", tag, toolchain])
+    return archive
+
+
+def build(site):
+    """Build the revision once in this machine's environment (or its container image); later
+    submissions reuse it. A revision is built where it runs, since programs may depend on where
+    they were built, so it is never built aside and moved."""
+    record, lock = site.build / "build.json", site.root / "builds" / (site.job["build"] + ".lock")
+    if not my_turn(site, lock, record, "this revision's build"):
+        return False
     log = site.build / "build.log"
     print("cloudsweep: building %s here (once per commit and setup); log %s" % (site.job["commit"][:12], log),
           file=sys.stderr, flush=True)
-    program = ("import sys; sys.path.insert(0, %r); import worker; sys.exit(worker.build_mode(%r, writable=False))"
-               % (str(HERE), str(site.build)))
+    if site.job.get("container"):
+        argv = in_container(site, [(site.build, "/work")], {"HOME": "/work", "GIT_OPTIONAL_LOCKS": "0"}) + \
+            ["build", "--keep-modes"]
+    else:
+        argv = [sys.executable, "-c", "import sys; sys.path.insert(0, %r); import worker; "
+                "sys.exit(worker.build_mode(%r, writable=False))" % (str(HERE), str(site.build))]
     try:
-        with open(str(log), "wb") as stream:
-            process = subprocess.Popen([sys.executable, "-c", program], stdin=subprocess.DEVNULL,
+        with open(str(log), "wb") as stream_:
+            process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(site.build),
                                        env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
             for line in process.stdout:
-                stream.write(line)
+                stream_.write(line)
                 sys.stderr.buffer.write(line)
                 sys.stderr.flush()
             process.wait()
@@ -258,7 +359,10 @@ def stop(site):
 
 def submit(site):
     """Build if needed, then start the work, unless the submission was cancelled meanwhile."""
-    result = {"built": build(site)}
+    result = {}
+    if site.job.get("container"):
+        result["image"] = ensure_image(site)
+    result["built"] = build(site)
     if site.cancelled():
         result["cancelled"] = True
     else:
@@ -293,10 +397,19 @@ def child(site, index=None):
             for name in ("build.json", core.RECIPE):
                 shutil.copy2(str(site.build / name), str(scratch / name))
         # The variables `cloudsweep try` sets for a local run; started.json records them.
-        os.environ.update(CLOUDSWEEP_WORK=str(scratch), CLOUDSWEEP_STORE="file://" + str(site.store),
-                          IMAGE_DIGEST=site.job["image_digest"], AWS_BATCH_JOB_ARRAY_INDEX=str(index),
-                          AWS_BATCH_JOB_ATTEMPT=str(attempt), AWS_BATCH_JOB_ID=label)
-        return worker.main(["run", site.submission])
+        env = dict(IMAGE_DIGEST=site.job["image_digest"], AWS_BATCH_JOB_ARRAY_INDEX=str(index),
+                   AWS_BATCH_JOB_ATTEMPT=str(attempt), AWS_BATCH_JOB_ID=label)
+        if not site.job.get("container"):
+            os.environ.update(env, CLOUDSWEEP_WORK=str(scratch), CLOUDSWEEP_STORE="file://" + str(site.store))
+            return worker.main(["run", site.submission])
+        env.update(CLOUDSWEEP_STORE="file:///store", HOME="/work")
+        env.update({name: os.environ[name] for name in ("CLOUDSWEEP_TIME_LIMIT", "CUDA_VISIBLE_DEVICES")
+                    if name in os.environ})
+        process = subprocess.Popen(in_container(site, [(scratch, "/work"), (site.store, "/store")], env) +
+                                   ["run", site.submission], stdin=subprocess.DEVNULL)
+        for signum in (signal.SIGTERM, signal.SIGINT):  # apptainer passes them to the worker
+            signal.signal(signum, lambda signum, frame: process.send_signal(signal.SIGTERM))
+        return process.wait()
     finally:
         shutil.rmtree(str(scratch), ignore_errors=True)
 
@@ -471,9 +584,12 @@ def listing(root, submission):
     return 0
 
 
-def check(root, kind, gpus_wanted):
+def check(root, kind, gpus_wanted, container):
     """What this machine provides, for cloudsweep doctor --on."""
     rows = [["python3", True, platform.python_version()]]
+    if container:
+        found = shutil.which("apptainer") or shutil.which("singularity")
+        rows.append(["apptainer", bool(found), found or "missing (container = apptainer)"])
     for tool in ("git", "rsync") + (("sbatch", "squeue", "scancel") if kind == "slurm" else ()):
         rows.append([tool, bool(shutil.which(tool)), shutil.which(tool) or "missing"])
     rows.append(["cpus", True, "%d usable here, %s" % (len(os.sched_getaffinity(0)), platform.machine())])
@@ -506,7 +622,7 @@ def main(argv):
         if action == "list":
             return listing(root, rest[0])
         if action == "check":
-            return check(root, rest[0], rest[1] == "1")
+            return check(root, rest[0], rest[1] == "1", rest[2] == "1")
         site = Site(root, rest[0])
         if action == "child":
             return child(site, int(rest[1]) if len(rest) > 1 else None)
