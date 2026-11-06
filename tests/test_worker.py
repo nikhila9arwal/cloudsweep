@@ -51,12 +51,12 @@ class Fixture:
         self.store.put_bytes(core.commands_bytes(commands), "submissions/%s/commands.jsonl" % self.submission)
         self.store.put_bytes(core.pretty(manifest), "submissions/%s/submission.json" % self.submission)
 
-    def run(self, child=0, attempt="1", digest=DIGEST):
+    def run(self, child=0, attempt="1", digest=DIGEST, **extra):
         """One child in a fresh copy of the built work directory, as each Batch job is a fresh container."""
         self.runs = getattr(self, "runs", 0) + 1
         work = self.root / ("container-%d" % self.runs)
         shutil.copytree(str(self.work), str(work), symlinks=True)
-        env = {"IMAGE_DIGEST": digest, "AWS_BATCH_JOB_ARRAY_INDEX": str(child), "AWS_BATCH_JOB_ATTEMPT": attempt}
+        env = dict(extra, IMAGE_DIGEST=digest, AWS_BATCH_JOB_ARRAY_INDEX=str(child), AWS_BATCH_JOB_ATTEMPT=attempt)
         return worker.run_mode(self.store, self.submission, env, str(work))
 
     def fetch(self):
@@ -95,6 +95,13 @@ class WorkerTests(unittest.TestCase):
         summary = fixture.fetch()
         self.assertFalse(summary["complete"])
         self.assertEqual(summary["children"][0]["verdict"], "failed")
+
+    def test_a_failure_to_prepare_the_command_is_recorded_in_its_attempt(self):
+        fixture = Fixture(self.scratch, [["{bin}", "{out}", "README", "0"]])
+        self.assertEqual(fixture.run(CLOUDSWEEP_PREPARE_ERROR="copying the built checkout failed: disk full"), 1)
+        attempt = fixture.fetch()["children"][0]["attempts"][0]
+        self.assertEqual(attempt["status"], "failed")
+        self.assertIn("disk full", attempt["error"])
 
     def test_a_retry_gets_its_own_attempt_directory(self):
         fixture = Fixture(self.scratch, [["{bin}", "{out}", "README", "0"]])

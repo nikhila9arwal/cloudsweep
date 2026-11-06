@@ -17,6 +17,9 @@
   builds it only when the submitting host cannot.
 - The file store copies files in blocks instead of reading them whole.
 - Image builds work with podman 3 (Ubuntu 22.04): no `--pull=missing`, and the auth file is created.
+- Each command's copy of the built checkout keeps contents, permission bits and links, not extended
+  attributes, which local disk refuses from a Lustre filesystem such as DeltaAI's. A failure to
+  prepare a command is recorded in its attempt.
 
 Tested end to end, with fetch reporting complete: a 24-command sweep as an ssh pool on an x86_64
 machine (its system Python 3.6), on this host with `--on local`, and as a Slurm array on the ECE

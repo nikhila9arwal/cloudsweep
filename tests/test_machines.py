@@ -462,6 +462,20 @@ class RemoteTests(unittest.TestCase):
         cpus = len(os.sched_getaffinity(0))
         self.assertEqual(len(remote.pool_slots({"gpus": 0, "slots": None, "vcpus": 1})), cpus)
 
+    def test_the_checkout_copy_keeps_modes_and_links(self):
+        root = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(root))
+        (root / "src/bin").mkdir(parents=True)
+        (root / "src/bin/run").write_text("#!/bin/sh\n")
+        (root / "src/bin/run").chmod(0o755)
+        (root / "src/data.txt").write_text("x")
+        (root / "src/data.txt").chmod(0o444)
+        (root / "src/link").symlink_to("bin/run")
+        remote.copy_tree(root / "src", root / "copy")
+        self.assertEqual((root / "copy/bin/run").stat().st_mode & 0o777, 0o755)
+        self.assertEqual((root / "copy/data.txt").stat().st_mode & 0o777, 0o444)
+        self.assertEqual(os.readlink(str(root / "copy/link")), "bin/run")
+
     def test_command_states(self):
         self.assertEqual(remote.child_state(None, "RUNNING", False), "running")
         self.assertEqual(remote.child_state(remote.NO_ATTEMPT, "PENDING", False), "waiting")

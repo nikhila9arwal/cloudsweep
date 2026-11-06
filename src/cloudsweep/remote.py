@@ -392,14 +392,17 @@ def child(site, index=None):
     else:
         label, attempt = "pool:%s" % site.job["machine"], 1
     scratch = Path(tempfile.mkdtemp(prefix="cloudsweep-%s-%d-" % (site.submission, index)))
+    # The variables `cloudsweep try` sets for a local run; started.json records them.
+    env = dict(IMAGE_DIGEST=site.job["image_digest"], AWS_BATCH_JOB_ARRAY_INDEX=str(index),
+               AWS_BATCH_JOB_ATTEMPT=str(attempt), AWS_BATCH_JOB_ID=label)
     try:
         if (site.build / "build.json").is_file():  # otherwise the worker records the missing build
-            shutil.copytree(str(site.build / "src"), str(scratch / "src"), symlinks=True)
-            for name in ("build.json", core.RECIPE):
-                shutil.copy2(str(site.build / name), str(scratch / name))
-        # The variables `cloudsweep try` sets for a local run; started.json records them.
-        env = dict(IMAGE_DIGEST=site.job["image_digest"], AWS_BATCH_JOB_ARRAY_INDEX=str(index),
-                   AWS_BATCH_JOB_ATTEMPT=str(attempt), AWS_BATCH_JOB_ID=label)
+            try:
+                copy_tree(site.build / "src", scratch / "src")
+                for name in ("build.json", core.RECIPE):
+                    shutil.copyfile(str(site.build / name), str(scratch / name))
+            except OSError as error:  # the worker records it in the attempt
+                env["CLOUDSWEEP_PREPARE_ERROR"] = "copying the built checkout for this command failed: %s" % error
         if not site.job.get("container"):
             os.environ.update(env, CLOUDSWEEP_WORK=str(scratch), CLOUDSWEEP_STORE="file://" + str(site.store))
             return worker.main(["run", site.submission])
@@ -421,6 +424,21 @@ def child(site, index=None):
         return started[0].wait()
     finally:
         shutil.rmtree(str(scratch), ignore_errors=True)
+
+
+def copy_tree(source, target):
+    """Copy the built checkout: contents, permission bits and symbolic links, nothing else. Extended
+    attributes do not travel: a shared filesystem's (Lustre's, for one) are refused by local disk."""
+    for root, directories, names in os.walk(str(source)):
+        destination = Path(target) / Path(root).relative_to(source)
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in directories + names:
+            path, copy = Path(root) / name, destination / name
+            if path.is_symlink():
+                os.symlink(os.readlink(str(path)), str(copy))
+            elif path.is_file():
+                shutil.copyfile(str(path), str(copy))
+                os.chmod(str(copy), path.stat().st_mode & 0o7777)
 
 
 def pool(site):

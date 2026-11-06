@@ -245,6 +245,7 @@ def run_mode(store, submission, env, work):
     STOP.interruptible = True
     try:
         manifest, commands = load_submission(store, submission)
+        core.require(not env.get("CLOUDSWEEP_PREPARE_ERROR"), env.get("CLOUDSWEEP_PREPARE_ERROR"))  # machines
         core.require(0 <= child < len(commands), "array index %d is outside the command manifest" % child)
         build = verified_build(manifest, env, paths)
         STOP.check()
