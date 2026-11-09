@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.2 (2026-11-09)
+
+- An image for a machine of another architecture is built here only when containers here can run
+  that architecture: binfmt_misc on, and QEMU's entry registered with the F flag, as
+  qemu-user-static does. 0.2.1 accepted any enabled entry, including Ubuntu's qemu-user-binfmt,
+  under which the build fails; such a host now leaves the build to the machine.
+
 ## 0.2.1 (2026-11-06)
 
 - An image already on a machine (`container = PATH.sif`) is identified with the machine's Python

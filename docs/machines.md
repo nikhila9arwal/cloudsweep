@@ -113,7 +113,8 @@ across machines and AWS.
 
 The image is built where AWS's is: on this host, with podman or Docker, for the machine's
 architecture. When the architectures differ, as for aarch64 DeltaAI from an x86 workstation, the
-build runs under QEMU emulation (on Ubuntu, `sudo apt install qemu-user-static` provides it). With
+build runs under QEMU emulation. On Ubuntu, `sudo apt install qemu-user-static` provides it;
+`qemu-user-binfmt` does not, because containers cannot find the emulator it registers. With
 Apptainer installed here, cloudsweep also converts the image to a SIF here; otherwise the machine
 converts the archive it receives. Either way it is uploaded once per image. Only when this host has
 no podman or Docker, or cannot emulate the machine's architecture, does the machine build the image

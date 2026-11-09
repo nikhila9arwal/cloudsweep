@@ -55,6 +55,7 @@ MISSING_CODE = 97  # remote exit status: this version of cloudsweep's code is no
 ACTIVE = ("PENDING", "RUNNING")
 PLATFORM_OF = {"x86_64": "linux/amd64", "amd64": "linux/amd64", "aarch64": "linux/arm64", "arm64": "linux/arm64"}
 QEMU = {"linux/amd64": "qemu-x86_64", "linux/arm64": "qemu-aarch64"}  # binfmt_misc entries for emulated builds
+BINFMT = Path("/proc/sys/fs/binfmt_misc")
 # An image file's size and modification time in nanoseconds, as remote.image_stamp gives them; read
 # with the machine's Python, since stat's formats differ between coreutils implementations.
 STAMP = "import os, sys; s = os.stat(os.path.expanduser(sys.argv[1])); print('%d:%d' % (s.st_size, s.st_mtime_ns))"
@@ -208,10 +209,22 @@ def builds_here(target):
         return False
     if platform.system() != "Linux" or target == PLATFORM_OF.get(platform.machine()):
         return True
+    return emulates(target)
+
+
+def emulates(target, binfmt=BINFMT):
+    """Whether containers here can run target's programs: binfmt_misc is enabled, and so is QEMU's
+    entry, with the F flag, so the kernel opens the emulator when the entry is registered. Without
+    F (as with Ubuntu's qemu-user-binfmt) it looks for the emulator inside each container, and an
+    ordinary image has none, so the build fails; qemu-user-static registers it with F."""
     try:
-        return Path("/proc/sys/fs/binfmt_misc", QEMU[target]).read_text().startswith("enabled")
-    except OSError:
+        if (Path(binfmt) / "status").read_text().split() != ["enabled"]:
+            return False
+        lines = (Path(binfmt) / QEMU[target]).read_text().splitlines()
+    except (OSError, KeyError):
         return False
+    flags = [line.split(":", 1)[1].strip() for line in lines if line.startswith("flags:")]
+    return bool(lines) and lines[0] == "enabled" and bool(flags) and "F" in flags[0]
 
 
 def prepare_image(repo, target):

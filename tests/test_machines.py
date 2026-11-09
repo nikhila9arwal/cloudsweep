@@ -523,6 +523,25 @@ class ContainerTests(MachineFixture):
         self.assertTrue((images / "base.sif").is_file())
 
 
+class EmulationTests(unittest.TestCase):
+    def test_only_an_emulator_registered_with_the_f_flag_builds_here(self):
+        binfmt = Path(tempfile.mkdtemp())
+        self.addCleanup(shutil.rmtree, str(binfmt), True)
+        entry, status = binfmt / "qemu-aarch64", binfmt / "status"
+        status.write_text("enabled\n")
+        for text, works in (("enabled\ninterpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P\nflags: PF\n", True),
+                            ("enabled\ninterpreter /usr/bin/qemu-aarch64-static\nflags: POCF\n", True),
+                            ("enabled\ninterpreter /usr/libexec/qemu-binfmt/aarch64-binfmt-P\nflags: P\n", False),
+                            ("disabled\ninterpreter /usr/bin/qemu-aarch64-static\nflags: F\n", False)):
+            entry.write_text(text)
+            self.assertEqual(machines.emulates("linux/arm64", binfmt), works, text)
+        status.write_text("disabled\n")  # binfmt_misc off as a whole, whatever its entries say
+        self.assertFalse(machines.emulates("linux/arm64", binfmt))
+        entry.unlink()
+        self.assertFalse(machines.emulates("linux/arm64", binfmt))
+        self.assertFalse(machines.emulates("linux/riscv64", binfmt))
+
+
 class RemoteTests(unittest.TestCase):
     def test_gpus_are_split_into_disjoint_slots(self):
         job = {"gpus": 2, "machine_gpus": 4, "slots": None}
