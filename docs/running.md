@@ -58,6 +58,7 @@ building, uploading or submitting; on AWS it prints the estimate. See
 | `--revision REV` | committed revision; default `HEAD` |
 | `--isolated` | on AWS, reserve the largest deployed instance's CPU and usable memory per command |
 | `--label TEXT` | label saved with the submission |
+| `--json` | on a machine, print one JSON object: the dry run's fields with the batch script, and after a submission its receipt and path |
 
 Commit tracked changes and `cloudsweep.ini` first; unknown placeholders are refused. On AWS, so
 are disabled cloud use, an active cutoff, requests that do not fit the instance types or cap, and
@@ -66,6 +67,12 @@ costs above the per-run ceiling.
 Submission prints its ID (on AWS, also the planned instance type and cost estimates) and writes a receipt under
 `.cloudsweep/receipts/`. **If the outcome is unknown, inspect that receipt and `cloudsweep status SUBMISSION`
 before retrying.** cloudsweep does not automatically resubmit; rerunning `submit` can duplicate work.
+
+For scripts, `submit --json` on a machine prints the receipt with every field of `--dry-run --json`,
+plus `receipt` (its path) and the machine's `result` (on Slurm, `slurm_job`). A refusal prints
+`{"error": ..., "submission": ..., "receipt": ..., "submission_state": ...}`; when `receipt` is not
+null, the work may have been sent, so inspect it before trying again. On AWS, `submit` prints text,
+and its receipt is the JSON record.
 
 ### Sizing
 

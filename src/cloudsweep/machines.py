@@ -447,6 +447,9 @@ def submit(args, prepare):
             plan["slots"] = ("one per %d GPU(s)" % gpus if gpus else machine["slots"] or
                              "one per %d CPU(s) of the machine" % vcpus)
         if args.dry_run:
+            if args.json:  # one JSON document, the batch script in it
+                print(json.dumps(dict(plan, dry_run=True, script=script), indent=2, sort_keys=True))
+                return 0
             print(json.dumps(dict(plan, dry_run=True), indent=2, sort_keys=True))
             if script:
                 print(script, end="")
@@ -482,8 +485,17 @@ def submit(args, prepare):
                 settings.write_receipt(path.parent, receipt, replace=True)
             except (ValueError, OSError):
                 pass
-            print("receipt: %s; check `cloudsweep status %s` before trying again" % (path, submission))
+            if not args.json:
+                print("receipt: %s; check `cloudsweep status %s` before trying again" % (path, submission))
+        if args.json:  # stdout stays one JSON document; with a receipt, the work may have been sent
+            print(json.dumps({"error": str(error), "receipt": str(path) if path else None,
+                              "submission": receipt["submission"] if receipt else None,
+                              "submission_state": receipt["submission_state"] if receipt else None},
+                             indent=2, sort_keys=True))
         return settings.fail(error)
+    if args.json:
+        print(json.dumps(dict(receipt, receipt=str(path), dry_run=False, script=script), indent=2, sort_keys=True))
+        return 0
     if result.get("cancelled"):
         print("%s was cancelled before it started" % submission)
         return 0

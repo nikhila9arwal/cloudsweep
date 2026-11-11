@@ -21,7 +21,8 @@ sweeps when AWS will finish sooner. Use `cloudsweep --help` for syntax and
    `complete`; a finished job is insufficient.
 4. Record the submission ID, commit and machine, and on AWS the printed estimate. On Slurm,
    record the GPU-hours and billing that `status` or `fetch` reports. Report month-to-date spend
-   from `cloudsweep status --on aws` when relevant.
+   from `cloudsweep status --on aws` when relevant. In scripts, use `submit --json` and
+   `status --json`; their times are UTC.
 5. Cancel unneeded work you started with `cloudsweep cancel SUBMISSION`.
 
 If submission has an unknown outcome, inspect its receipt and `cloudsweep status SUBMISSION`

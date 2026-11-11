@@ -10,6 +10,8 @@
   each task's state, start, end, elapsed time, node, allocated GPUs and billing units (for a
   requeued task, each execution's), with the GPU-hours and billing unit-hours summed (`accounting` in `status --json` and in `fetch.json`).
   The final record is kept on the machine. A cluster without accounting still shows the queue.
+- `submit --json` on a machine prints one JSON object: the receipt, which has every field of the
+  dry run, with its path. `submit --dry-run --json` prints the plan with the batch script in it.
 
 ## 0.2.2 (2026-11-09)
 

@@ -536,6 +536,30 @@ class SlurmTests(MachineFixture):
         sacct.unlink()
         self.assertIn("Slurm accounting unavailable: sacct: ", self.cli("status", submission)[1])
 
+    def test_submit_json_gives_the_dry_run_fields_and_the_receipt(self):
+        code, out, _ = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--commands",
+                                        str(self.sweep), "--input", "trace.bin")
+        plan = json.loads(out)  # one document, the batch script in it
+        self.assertTrue(plan["dry_run"])
+        self.assertIn("#SBATCH --array=0-2", plan["script"])
+        code, out, err = self.cli_streams("submit", "--on", "cluster", "--json", "--commands", str(self.sweep),
+                                          "--input", "trace.bin")
+        self.assertEqual(code, 0, err)
+        sent = json.loads(out)
+        self.assertLessEqual(set(plan), set(sent))
+        self.assertFalse(sent["dry_run"])
+        self.assertEqual((sent["submission_state"], sent["result"]["slurm_job"]), ("submitted", "4242"))
+        self.assertEqual(json.loads(Path(sent["receipt"]).read_text()),
+                         {key: value for key, value in sent.items() if key not in ("receipt", "dry_run", "script")})
+        code, out, err = self.cli_streams("submit", "--on", "nowhere", "--json", "--commands", str(self.sweep))
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(out), {"error": json.loads(out)["error"], "receipt": None, "submission": None,
+                                           "submission_state": None})
+        self.assertIn("no machine [nowhere]", json.loads(out)["error"])
+        code, out, err = self.cli_streams("submit", "--on", "aws", "--json", "--commands", str(self.sweep))
+        self.assertEqual((code, out), (1, ""))
+        self.assertIn("--json is for machines", err)
+
 
 FAKE_APPTAINER = """#!{python}
 import os, shutil, sys

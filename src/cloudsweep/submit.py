@@ -279,6 +279,8 @@ def route(parser, args):
     """Without --on, run on this host; --on aws takes the AWS path, any other name a machine."""
     check_command_args(parser, args)
     if args.on == machines.AWS:
+        if args.json:
+            raise Refusal("--json is for machines; on AWS, submit prints text and its receipt is JSON")
         return main(args)
     args.on = args.on or machines.LOCAL
     return machines.submit(args, prepare)
@@ -299,6 +301,9 @@ def add_arguments(commands):
                         help="on AWS: reserve a whole instance of the largest type per command (timing experiments)")
     parser.add_argument("--label", default="", help="free text recorded in the manifest and receipt")
     parser.add_argument("--dry-run", action="store_true", help="check and estimate; build, upload and submit nothing")
+    parser.add_argument("--json", action="store_true",
+                        help="on a machine: print one JSON object, the dry run's fields (with the batch script) "
+                             "and, after a submission, its receipt")
     parser.set_defaults(handler=lambda args: route(parser, args))
 
     trial_parser = commands.add_parser(
