@@ -19,8 +19,9 @@ sweeps when AWS will finish sooner. Use `cloudsweep --help` for syntax and
    worst case before `cloudsweep submit --on aws ...`.
 3. Fetch with `cloudsweep fetch SUBMISSION DEST --wait`. Use results only when it reports
    `complete`; a finished job is insufficient.
-4. Record the submission ID, commit and machine, and on AWS the printed estimate. Report
-   month-to-date spend from `cloudsweep status --on aws` when relevant.
+4. Record the submission ID, commit and machine, and on AWS the printed estimate. On Slurm,
+   record the GPU-hours and billing that `status` or `fetch` reports. Report month-to-date spend
+   from `cloudsweep status --on aws` when relevant.
 5. Cancel unneeded work you started with `cloudsweep cancel SUBMISSION`.
 
 If submission has an unknown outcome, inspect its receipt and `cloudsweep status SUBMISSION`

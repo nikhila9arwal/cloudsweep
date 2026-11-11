@@ -49,9 +49,13 @@ import worker  # noqa: E402
 
 RESULT = "CLOUDSWEEP-RESULT "
 SLURM_RUNNING = ("RUNNING", "COMPLETING")
-# squeue: array task, state, reason, start (for a pending task Slurm's estimate), nodes, and the
-# nodes Slurm expects to use for a pending task.
+# Slurm states a task does not leave once it has ended; sacct's line for it is then final.
+SLURM_ENDED = ("BOOT_FAIL", "CANCELLED", "COMPLETED", "DEADLINE", "FAILED", "NODE_FAIL", "OUT_OF_MEMORY",
+               "PREEMPTED", "REVOKED", "TIMEOUT")
+# squeue: array task, state, reason, start (for a pending task Slurm's estimate), nodes, nodes
+# expected for a pending task. sacct: one line per array task, or per range of tasks that never ran.
 QUEUE_FORMAT = "%K|%T|%r|%S|%N|%Y"
+ACCOUNTING_FIELDS = "JobID,State,Start,End,ElapsedRaw,NodeList,Partition,AllocTRES,ExitCode"
 NO_ATTEMPT = object()
 
 
@@ -587,6 +591,83 @@ def slurm_tasks(job):
     return {index: task["state"] for index, task in slurm_queue(job).items()}
 
 
+def task_indices(text):
+    """The array tasks a sacct line names: 4242_7 is task 7, 4242_[0-3,5%2] tasks that never ran."""
+    _, _, tasks = text.partition("_")
+    if tasks.isdigit():
+        return [int(tasks)]
+    found = []
+    for part in tasks.strip("[]").split("%")[0].split(","):
+        first, _, last = part.partition("-")
+        if first.isdigit() and (not last or last.isdigit()):
+            found.extend(range(int(first), int(last or first) + 1))
+    return found
+
+
+def allocated(tres):
+    """AllocTRES as sacct prints it (billing=2000,cpu=8,gres/gpu=1,mem=96G,node=1): the billing
+    units and the GPUs, the typed gres/gpu:TYPE counts when no plain one is given."""
+    counts, typed = {}, 0
+    for item in tres.split(","):
+        name, _, value = item.partition("=")
+        try:
+            number = float(value)
+        except ValueError:
+            continue
+        if name.startswith("gres/gpu:"):
+            typed += number
+        counts[name] = number
+    gpus = counts.get("gres/gpu", typed)
+    billing = counts.get("billing")
+    return (int(billing) if billing is not None and billing == int(billing) else billing), int(gpus)
+
+
+def slurm_accounting(job):
+    """Slurm's accounting of the array's tasks, from sacct in UTC: for each execution of a task, its
+    state, start, end, elapsed seconds, nodes, partition, allocated GPUs and billing units, and exit
+    code, in order. A requeued task has one entry per execution (--duplicates: otherwise sacct shows
+    only the latest, and the time an earlier one used is lost). A task that never ran has no start
+    and 0 seconds."""
+    try:
+        done = run(["sacct", "-j", job, "-X", "-D", "-n", "-P", "-o", ACCOUNTING_FIELDS], env=slurm_env())
+    except OSError as error:  # a cluster without accounting may have no sacct; status still works
+        return {"error": "sacct: %s" % error}
+    if done.returncode:
+        return {"error": "sacct failed: %s" % (done.stderr.strip() or "exit %d" % done.returncode)}
+    tasks = []
+    for line in done.stdout.splitlines():
+        fields = line.strip().split("|")
+        if len(fields) < 9 or not fields[0].startswith(job + "_"):
+            continue
+        state = (fields[1].split() or ["UNKNOWN"])[0]  # CANCELLED by 1234 -> CANCELLED
+        if state in ("PENDING", "REQUEUE_HOLD"):  # queued now; squeue reports it
+            continue
+        start = slurm_time(fields[2])
+        billing, gpus = allocated(fields[7])
+        for index in task_indices(fields[0]):
+            tasks.append({"task": index, "state": state, "start": start, "end": slurm_time(fields[3]),
+                          "elapsed_s": int(fields[4]) if fields[4].isdigit() and start else 0,
+                          "nodes": slurm_value(fields[5]), "partition": slurm_value(fields[6]),
+                          "gpus": gpus if start else 0, "billing": billing if start else None,
+                          "exit_code": slurm_value(fields[8])})
+    return {"tasks": sorted(tasks, key=lambda task: task["task"])}  # stable: executions stay in order
+
+
+def final_accounting(site, job, count):
+    """sacct's record once every task has ended; kept in accounting.json, since it no longer
+    changes, so that later status calls do not ask the accounting database again."""
+    kept = read_json(site.dir / "accounting.json")
+    if isinstance(kept, dict) and kept.get("job") == job:
+        return kept["accounting"]
+    found = slurm_accounting(job)
+    latest = {}
+    for task in found.get("tasks") or []:
+        latest[task["task"]] = task  # a task's last execution decides whether it has ended
+    if sorted(latest) == list(range(count)) and all(task["state"] in SLURM_ENDED for task in latest.values()):
+        write_json(site.dir / "accounting.json", {"job": job, "accounting": found})
+    return found
+
+
 def pool_alive(site, state):
     """Whether this submission's pool still runs: an unfinished record whose process is that pool
     (a process id can be reused once the pool has ended)."""
@@ -626,6 +707,10 @@ def site_status(site):
                                       "PENDING" if active else "FINISHED"))
         if tasks:
             report["queue"] = [dict(task=index, **tasks[index]) for index in sorted(tasks)]
+        if job and (len(tasks) < site.job["count"] or any(t["state"] != "PENDING" for t in tasks.values())):
+            # Some task has started or ended: sacct accounts for it (final once none is queued).
+            report["accounting"] = (final_accounting(site, job, site.job["count"]) if not tasks
+                                    else slurm_accounting(job))
         started = bool(job)
     else:
         if state.get("host") and state["host"] != socket.gethostname():

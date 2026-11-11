@@ -608,6 +608,57 @@ def queue_text(queue):
     return "; ".join(parts)
 
 
+def clock(seconds):
+    return "%d:%02d:%02d" % (seconds // 3600, seconds // 60 % 60, seconds % 60)
+
+
+def amount(value):
+    """A number for people: 0, 0.073, 1037.8."""
+    if not value:
+        return "0"
+    return "%.2g" % value if abs(value) < 0.001 else ("%.3f" % value).rstrip("0").rstrip(".")
+
+
+def with_totals(accounting):
+    """sacct's tasks with their sums: elapsed seconds; GPU-hours, the allocated GPUs times the
+    elapsed time; and billing unit-hours, Slurm's billing units times the elapsed time."""
+    tasks = accounting.get("tasks")
+    if tasks is None:
+        return accounting
+    states, billed = {}, [task for task in tasks if task["billing"] is not None]
+    for task in tasks:
+        states[task["state"]] = states.get(task["state"], 0) + 1
+    totals = {"states": states, "elapsed_s": sum(task["elapsed_s"] for task in tasks),
+              "gpu_hours": round(sum(task["gpus"] * task["elapsed_s"] for task in tasks) / 3600, 6),
+              "billing_unit_hours": round(sum(task["billing"] * task["elapsed_s"] for task in billed) / 3600, 6)
+              if billed else None}
+    return dict(accounting, totals=totals)
+
+
+def accounting_text(accounting):
+    """One line of Slurm's accounting: states, elapsed time, GPU-hours and billing."""
+    if accounting.get("error"):
+        return "Slurm accounting unavailable: %s" % accounting["error"]
+    tasks, totals = accounting["tasks"], accounting["totals"]
+    if not tasks:
+        return "Slurm accounting: no record of the job yet"
+    text = "Slurm accounting: %s; elapsed %s" % (", ".join("%d %s" % (count, state) for state, count in
+                                                           sorted(totals["states"].items())),
+                                                clock(totals["elapsed_s"]))
+    ran = [task for task in tasks if task["start"]]
+    if len(tasks) == 1 and ran:
+        text += " (%s to %s%s)" % (ran[0]["start"], ran[0]["end"] or "now",
+                                   " on " + ran[0]["nodes"] if ran[0]["nodes"] else "")
+    elif len(tasks) > 1:
+        text += " in all"
+    text += "; %s GPU-hours" % amount(totals["gpu_hours"])
+    units = sorted({task["billing"] for task in ran if task["billing"] is not None})
+    if totals["billing_unit_hours"] is not None:
+        text += "; billing %s%s unit-hours" % ("%s unit(s) per task, " % amount(units[0]) if len(units) == 1 else "",
+                                              amount(totals["billing_unit_hours"]))
+    return text
+
+
 def describe(submission, row):
     children = " children %s" % json.dumps(row["children"], sort_keys=True) if row.get("children") else ""
     job = ""
@@ -615,8 +666,18 @@ def describe(submission, row):
         job = " (Slurm job %s%s)" % (row["job"], ": " + queue_text(row["queue"]) if row.get("queue") else "")
     elif row.get("job"):
         job = " (pool process %s)" % row["job"]
-    return "  %s %s%s%s%s" % (submission, row.get("state", "UNKNOWN"), children, job,
+    line = "  %s %s%s%s%s" % (submission, row.get("state", "UNKNOWN"), children, job,
                               " " + row["error"] if row.get("error") else "")
+    return line + ("\n    " + accounting_text(row["accounting"]) if row.get("accounting") else "")
+
+
+def call_status(machine, *submissions):
+    """remote.py status, with the sums of each Slurm submission's accounting added."""
+    report = call(machine, "status", *submissions)
+    for row in report.values():
+        if isinstance(row, dict) and isinstance(row.get("accounting"), dict):
+            row["accounting"] = with_totals(row["accounting"])
+    return report
 
 
 def status(args, groups):
@@ -626,7 +687,7 @@ def status(args, groups):
     for name, wanted in groups.items():
         machine = load(repo, name)
         wanted = wanted or receipts(repo, name)
-        report = call(machine, "status", *wanted) if wanted else {}
+        report = call_status(machine, *wanted) if wanted else {}
         reports.update(report)
         if args.json:
             continue
@@ -650,7 +711,7 @@ def cancel(args, name):
             print("  %s: %s" % (submission, report.get(submission)))
     deadline = time.monotonic() + 60 * args.wait
     while args.wait and wanted:
-        rows = call(machine, "status", *wanted)
+        rows = call_status(machine, *wanted)
         busy = [s for s in wanted if rows.get(s, {}).get("state") in ACTIVE]
         if not busy:
             break
@@ -686,7 +747,7 @@ def wait_for(machine, submission, minutes):
     """Poll the submission until its job leaves the queue or its pool ends, at most minutes long."""
     deadline = time.monotonic() + 60 * minutes
     while True:
-        row = call(machine, "status", submission).get(submission, {})
+        row = call_status(machine, submission).get(submission, {})
         print(describe(submission, row).strip(), flush=True)
         if row.get("state") not in ACTIVE:
             return row
@@ -720,6 +781,14 @@ def fetch_results(args, name):
         rsync("-rt", "--ignore-existing", "--ignore-missing-args", "--exclude=" + attempts, runs,
               str(destination) + "/")
         summary = fetch.fetch(Fetched(listing, records, destination, submission), submission, destination)
+    if machine["kind"] == "slurm":
+        # What Slurm accounted for the job, beside the verified results (not part of their verification).
+        row = call_status(machine, submission).get(submission, {})
+        if row.get("accounting"):
+            summary["accounting"] = dict(row["accounting"], job=row.get("job"))
+            fetch.no_symlinks(destination / submission / "fetch.json")
+            (destination / submission / "fetch.json").write_bytes(core.pretty(summary))
+            print(accounting_text(summary["accounting"]))
     fetch.print_summary(summary, destination)
     return 0 if summary["complete"] else 1
 

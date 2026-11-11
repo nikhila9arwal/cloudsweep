@@ -111,15 +111,25 @@ $ cloudsweep status 20261111T120000Z-1a2b3c 20261111T130000Z-4d5e6f     # illust
 ece-gpu (slurm, ece-gpu:cloudsweep)
   20261111T120000Z-1a2b3c PENDING children {"waiting": 2} (Slurm job 1001: 2 pending (JobHeldUser), no start estimate)
   20261111T130000Z-4d5e6f RUNNING children {"running": 1} (Slurm job 1002: 1 running on node07 since 2026-11-11T13:05:40Z)
+    Slurm accounting: 1 RUNNING; elapsed 0:10:00 (2026-11-11T13:05:40Z to now on node07); 0.167 GPU-hours; billing 8 unit(s) per task, 1.333 unit-hours
 ```
 
 For a job in Slurm's queue, `status` shows each state's tasks: a pending task's reason (`Priority`,
 `Resources`, `JobHeldUser`, ...) and Slurm's estimated start, or `no start estimate` when Slurm
 gives none (`N/A`, as on clusters without backfill estimates), and a running task's node and start.
+Once a task has started, `sacct`'s accounting follows: the tasks' states, their elapsed time, the
+GPU-hours (allocated GPUs times elapsed time) and the billing unit-hours (Slurm's billing units
+times elapsed time). `fetch` prints the same line and keeps the accounting in `fetch.json`. Once
+every task has ended, the record is final and kept in `workdir/jobs/<submission>/accounting.json`.
 
-Times are UTC. Slurm prints the cluster's local time, so cloudsweep runs `squeue` with `TZ=UTC` and
-`SLURM_TIME_FORMAT=standard`. `status --json` gives them as `queue` (task, state, reason, start,
-nodes; for a pending task its start is the estimate and its nodes those Slurm expects to use).
+Times are UTC. Slurm prints the cluster's local time, so cloudsweep runs `squeue` and `sacct` with
+`TZ=UTC` and `SLURM_TIME_FORMAT=standard`. `status --json` gives them as `queue` (task, state,
+reason, start, nodes; for a pending task its start is the estimate and its nodes those Slurm
+expects to use) and `accounting` (`tasks`, one entry per execution of a task, each with state,
+start, end, `elapsed_s`, nodes, partition, `gpus`, `billing` and `exit_code`, and their `totals`). A
+task Slurm requeued has an entry for each execution (`sacct --duplicates`), so the time an earlier
+execution used is counted. A cluster without accounting
+still shows the queue, with the accounting reported as unavailable.
 
 ## Containers
 

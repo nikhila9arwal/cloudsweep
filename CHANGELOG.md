@@ -4,8 +4,12 @@
 
 - `status` on a Slurm machine shows why each pending task waits (Slurm's reason), Slurm's estimated
   start or `no start estimate`, and each running task's node and start; `--json` carries them as
-  `queue`. Times are UTC: `squeue` runs with `TZ=UTC` and `SLURM_TIME_FORMAT=standard`, since
-  clusters print their local time.
+  `queue`. Times are UTC: `squeue` and `sacct` run with `TZ=UTC` and `SLURM_TIME_FORMAT=standard`,
+  since clusters print their local time.
+- `status` and `fetch` on a Slurm machine report `sacct`'s accounting once a task has started:
+  each task's state, start, end, elapsed time, node, allocated GPUs and billing units (for a
+  requeued task, each execution's), with the GPU-hours and billing unit-hours summed (`accounting` in `status --json` and in `fetch.json`).
+  The final record is kept on the machine. A cluster without accounting still shows the queue.
 
 ## 0.2.2 (2026-11-09)
 

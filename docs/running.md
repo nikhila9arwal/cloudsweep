@@ -84,7 +84,8 @@ cloudsweep status --storage           # retained AWS bucket objects and registry
 ```
 
 On a Slurm machine, `status` also shows why a job waits (Slurm's pending reason), its estimated
-start and its node, in UTC ([watching a job on Slurm](machines.md#watching-a-job-on-slurm)).
+start and its node, and once it has started, Slurm's accounting: elapsed time, GPU-hours and billing
+units, all in UTC ([watching a job on Slurm](machines.md#watching-a-job-on-slurm)).
 
 On AWS, desired capacity is what Batch requested, not the number of running instances. Spend comes from
 the guard's [budget snapshot](admin.md#costs-and-limits) and lags usage. Status remains available
@@ -107,7 +108,7 @@ The default destination is `cloudsweep-results/SUBMISSION/`:
 SUBMISSION/
   submission.json       commit, image, recipe, inputs, resources
   commands.jsonl        submitted commands
-  fetch.json            verdicts and verification problems
+  fetch.json            verdicts and verification problems; on Slurm, its accounting
   0/                    command index
     1/                  attempt number
       manifest.json     status, exit code, timing, provenance, file hashes

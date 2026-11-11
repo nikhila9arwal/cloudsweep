@@ -88,7 +88,7 @@ last = int(re.search(r"#SBATCH --array=0-(\\d+)", text).group(1))
 output = re.search(r"#SBATCH --output=(\\S+)", text).group(1)
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write("sbatch %s\\n" % json.dumps(flags))
-if os.environ.get("FAKE_HOLD"):  # queued: the test says what squeue shows
+if os.environ.get("FAKE_HOLD"):  # queued: the test says what squeue and sacct show
     print("4242")
     sys.exit(0)
 for index in range(last + 1):
@@ -97,7 +97,7 @@ for index in range(last + 1):
         subprocess.run(["/bin/bash", script], env=env, stdout=out, stderr=subprocess.STDOUT)
 print("4242")
 """
-# squeue prints FAKE_SLURM/queue.txt, where {t:EPOCH} becomes a time as
+# squeue and sacct print FAKE_SLURM/queue.txt and accounting.txt, where {t:EPOCH} becomes a time as
 # Slurm prints it: in the zone TZ names, and in ISO 8601 only with SLURM_TIME_FORMAT=standard.
 FAKE_REPORTER = """#!{python}
 import os, re, sys, time
@@ -129,6 +129,7 @@ class MachineFixture(unittest.TestCase):
         fakes.mkdir()
         for name, text in (("ssh", FAKE_SSH), ("sbatch", FAKE_SBATCH),
                            ("squeue", FAKE_REPORTER % ("queue.txt", "squeue")),
+                           ("sacct", FAKE_REPORTER % ("accounting.txt", "sacct")),
                            ("scancel", "#!/bin/sh\necho scancel \"$@\" >> \"$FAKE_LOG\"\n")):
             (fakes / name).write_text(text.format(python=sys.executable))
             (fakes / name).chmod(0o755)
@@ -415,7 +416,8 @@ def utc(*when):
 
 
 class SlurmTests(MachineFixture):
-    """What status reads from Slurm's queue, with fake squeue output."""
+    """What status and fetch read from Slurm: the queue and the accounting, with fake squeue and
+    sacct output."""
 
     def held(self, *extra):
         os.environ["FAKE_HOLD"] = "1"  # sbatch queues the job and runs nothing
@@ -437,17 +439,102 @@ class SlurmTests(MachineFixture):
             {"task": 0, "state": "PENDING", "reason": "Priority", "start": "2026-11-11T02:43:00Z", "nodes": "node12"},
             {"task": 1, "state": "PENDING", "reason": None, "start": None, "nodes": None},
             {"task": 2, "state": "PENDING", "reason": None, "start": None, "nodes": None}])
+        self.assertNotIn("accounting", row)  # nothing has run, so sacct is not asked
+        self.assertNotIn("sacct", self.log.read_text())
         (self.slurm / "queue.txt").write_text("0|PENDING|JobHeldUser|N/A||(null)\n")
         self.assertIn("(Slurm job 4242: 1 pending (JobHeldUser), no start estimate)", self.cli("status", submission)[1])
 
-    def test_a_running_task_shows_its_node_and_its_start(self):
+    def test_a_running_task_shows_its_node_its_start_and_what_it_has_used(self):
         submission = self.held()
         start = utc(2026, 11, 11, 9, 12, 27)
         (self.slurm / "queue.txt").write_text("0|RUNNING|None|{t:%d}|node02|(null)\n1|PENDING|Resources|N/A||\n"
                                               "2|PENDING|Resources|N/A||\n" % start)
+        (self.slurm / "accounting.txt").write_text(
+            "4242_0|RUNNING|{t:%d}|Unknown|120|node02|gpu|billing=8,cpu=8,gres/gpu:h100=1,gres/gpu=1,node=1|0:0\n"
+            "4242_[1-2]|PENDING|Unknown|Unknown|0|None assigned|gpu||0:0\n" % start)
         code, out = self.cli("status", submission)
         self.assertIn('RUNNING children {"running": 1, "waiting": 2} (Slurm job 4242: 1 running on node02 since '
                       '2026-11-11T09:12:27Z; 2 pending (Resources), no start estimate)', out)
+        self.assertIn("Slurm accounting: 1 RUNNING; elapsed 0:02:00 (2026-11-11T09:12:27Z to now on node02); "
+                      "0.033 GPU-hours; billing 8 unit(s) per task, 0.267 unit-hours", out)
+        self.assertFalse((self.root / "cluster/jobs" / submission / "accounting.json").exists())  # not final
+
+    def test_accounting_of_finished_failed_and_cancelled_tasks_is_read_once(self):
+        submission = self.held()
+        (self.slurm / "accounting.txt").write_text(
+            "4242_0|COMPLETED|{t:%d}|{t:%d}|1868|node64|gpu-short|billing=2000,cpu=8,gres/gpu=1,mem=96G,node=1|0:0\n"
+            "4242_1|FAILED|{t:%d}|{t:%d}|193|node02|gpu|billing=8,cpu=8,gres/gpu:h100=1,gres/gpu=1,node=1|1:0\n"
+            "4242_[2]|CANCELLED by 1234|None|{t:%d}|0|None assigned|gpu||0:0\n" % (
+                utc(2026, 11, 11, 16, 5, 40), utc(2026, 11, 11, 16, 36, 48), utc(2026, 11, 11, 9, 12, 27),
+                utc(2026, 11, 11, 9, 15, 40), utc(2026, 11, 11, 9, 15, 41)))
+        os.environ["TZ"] = "Asia/Kolkata"
+        code, out = self.cli("status", submission)
+        self.assertIn("%s FINISHED" % submission, out)
+        self.assertIn("Slurm accounting: 1 CANCELLED, 1 COMPLETED, 1 FAILED; elapsed 0:34:21 in all; 0.573 GPU-hours; "
+                      "billing 1038.207 unit-hours", out)
+        accounting = json.loads(self.cli_streams("status", "--json", submission)[1])[submission]["accounting"]
+        self.assertEqual(accounting["tasks"][0], {
+            "task": 0, "state": "COMPLETED", "start": "2026-11-11T16:05:40Z", "end": "2026-11-11T16:36:48Z",
+            "elapsed_s": 1868, "nodes": "node64", "partition": "gpu-short", "gpus": 1, "billing": 2000,
+            "exit_code": "0:0"})
+        self.assertEqual(accounting["tasks"][2], {
+            "task": 2, "state": "CANCELLED", "start": None, "end": "2026-11-11T09:15:41Z", "elapsed_s": 0,
+            "nodes": None, "partition": "gpu", "gpus": 0, "billing": None, "exit_code": "0:0"})
+        self.assertEqual(accounting["totals"], {"states": {"CANCELLED": 1, "COMPLETED": 1, "FAILED": 1},
+                                                "elapsed_s": 2061, "gpu_hours": round(2061 / 3600, 6),
+                                                "billing_unit_hours": round((2000 * 1868 + 8 * 193) / 3600, 6)})
+        (self.slurm / "accounting.txt").unlink()  # final: kept on the machine, not asked for again
+        self.assertEqual(json.loads(self.cli_streams("status", "--json", submission)[1])[submission]["accounting"],
+                         accounting)
+        self.assertEqual(self.log.read_text().count("sacct\n"), 1)
+        destination = self.root / "results"
+        code, out = self.cli("fetch", submission, str(destination))
+        self.assertEqual(code, 1, out)  # no command ran here: incomplete, and accounted for
+        self.assertIn("Slurm accounting: 1 CANCELLED, 1 COMPLETED, 1 FAILED", out)
+        self.assertTrue(out.strip().splitlines()[-1].startswith("INCOMPLETE: "))
+        kept = json.loads((destination / submission / "fetch.json").read_text())
+        self.assertEqual((kept["accounting"]["job"], kept["accounting"]["totals"]), ("4242", accounting["totals"]))
+
+    def test_every_execution_of_a_requeued_task_is_accounted_for(self):
+        submission = self.held()
+        (self.slurm / "accounting.txt").write_text(
+            "4242_0|REQUEUED|{t:%d}|{t:%d}|6|node04|cpu|billing=2,cpu=2,node=1|0:0\n"
+            "4242_0|COMPLETED|{t:%d}|{t:%d}|60|node04|cpu|billing=2,cpu=2,node=1|0:0\n"
+            "4242_1|COMPLETED|{t:%d}|{t:%d}|30|node05|cpu|billing=2,cpu=2,node=1|0:0\n"
+            "4242_2|REQUEUED|{t:%d}|{t:%d}|5|node05|cpu|billing=2,cpu=2,node=1|0:0\n"
+            "4242_2|PENDING|Unknown|Unknown|0|None assigned|cpu||0:0\n" % (
+                utc(2026, 11, 11, 22, 9, 27), utc(2026, 11, 11, 22, 9, 33), utc(2026, 11, 11, 22, 11, 40),
+                utc(2026, 11, 11, 22, 12, 40), utc(2026, 11, 11, 22, 9, 27), utc(2026, 11, 11, 22, 9, 57),
+                utc(2026, 11, 11, 22, 9, 27), utc(2026, 11, 11, 22, 9, 32)))
+        (self.slurm / "queue.txt").write_text("2|PENDING|BeginTime|{t:%d}||\n" % utc(2026, 11, 11, 22, 11, 35))
+        accounting = json.loads(self.cli_streams("status", "--json", submission)[1])[submission]["accounting"]
+        self.assertEqual([(task["task"], task["state"], task["elapsed_s"]) for task in accounting["tasks"]],
+                         [(0, "REQUEUED", 6), (0, "COMPLETED", 60), (1, "COMPLETED", 30), (2, "REQUEUED", 5)])
+        self.assertEqual(accounting["totals"]["elapsed_s"], 101)
+        self.assertFalse((self.root / "cluster/jobs" / submission / "accounting.json").exists())  # 2 is queued
+        (self.slurm / "queue.txt").unlink()
+        with open(str(self.slurm / "accounting.txt"), "a") as stream:
+            stream.write("4242_2|COMPLETED|{t:%d}|{t:%d}|40|node05|cpu|billing=2,cpu=2,node=1|0:0\n" % (
+                utc(2026, 11, 11, 22, 11, 40), utc(2026, 11, 11, 22, 12, 20)))
+        text = (self.slurm / "accounting.txt").read_text().replace(
+            "4242_2|PENDING|Unknown|Unknown|0|None assigned|cpu||0:0\n", "")
+        (self.slurm / "accounting.txt").write_text(text)
+        code, out = self.cli("status", submission)
+        self.assertIn("Slurm accounting: 3 COMPLETED, 2 REQUEUED; elapsed 0:02:21 in all", out)
+        self.assertTrue((self.root / "cluster/jobs" / submission / "accounting.json").exists())  # final
+
+    def test_status_works_when_sacct_does_not(self):
+        submission = self.held()
+        sacct = self.root / "bin" / "sacct"
+        sacct.write_text("#!/bin/sh\necho 'sacct: error: Slurm accounting storage is disabled' >&2\nexit 1\n")
+        code, out = self.cli("status", submission)
+        self.assertEqual(code, 0, out)
+        self.assertIn("%s FINISHED" % submission, out)
+        self.assertIn("Slurm accounting unavailable: sacct failed: sacct: error: Slurm accounting storage is disabled",
+                      out)
+        self.assertFalse((self.root / "cluster/jobs" / submission / "accounting.json").exists())
+        sacct.unlink()
+        self.assertIn("Slurm accounting unavailable: sacct: ", self.cli("status", submission)[1])
 
 
 FAKE_APPTAINER = """#!{python}
@@ -652,6 +739,12 @@ class RemoteTests(unittest.TestCase):
                          [None, None, None, None, None, "node64"])
         self.assertEqual(remote.slurm_time("2026-11-11T09:12:27"), "2026-11-11T09:12:27Z")
         self.assertIsNone(remote.slurm_time("Tue 20:43"))  # not UTC in ISO 8601: never guessed
+        self.assertEqual(remote.task_indices("4242_7"), [7])
+        self.assertEqual(remote.task_indices("4242_[0-3,5%2]"), [0, 1, 2, 3, 5])
+        self.assertEqual(remote.allocated("billing=2000,cpu=8,gres/gpu=1,mem=96G,node=1"), (2000, 1))
+        self.assertEqual(remote.allocated("billing=8,cpu=8,gres/gpu:h100=1,gres/gpu=1,node=1"), (8, 1))
+        self.assertEqual(remote.allocated("billing=2,cpu=2,gres/gpu:a=1,gres/gpu:b=2,node=1"), (2, 3))
+        self.assertEqual(remote.allocated(""), (None, 0))
 
     def test_a_reused_process_id_is_not_taken_for_the_pool(self):
         site = mock.Mock(submission="20261106T000000Z-aaaaaa")
