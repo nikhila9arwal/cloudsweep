@@ -6,7 +6,8 @@
 
 Sweep files contain one JSON argument list per line. Tracked edits are refused.
 Placeholders: {bin} program, {out} outputs, {src} checkout, {index} zero-based command
-index, {input:NAME} input path. Use {{ and }} for literal braces.
+index, {input:NAME} input path; on a machine also {var:NAME}, from its vars, and {machine},
+its name. Use {{ and }} for literal braces.
 
 On AWS, the local per-run ceiling checks the most expensive fitting deployed instance for
 the time limit. Retries, startup, idle time and non-compute charges are additional.
@@ -23,6 +24,41 @@ from pathlib import Path
 
 from . import core, engine, fetch, machines, project, settings
 from .project import Refusal
+
+
+def resolve_machine(text, machine):
+    """{var:NAME} and {machine} resolved against the machine a submission goes to, before the
+    worker's placeholders, which stay: a value's braces are doubled, so the worker reads them as
+    text, and {{var:x}} stays literal. Returns the resolved text, the template's sha256 (the
+    commands before resolution) and the variables used."""
+    template, resolved, used = [], [], {}
+    for number, line in enumerate(text.splitlines(), 1):
+        stripped = line.strip()
+        if not stripped or stripped.startswith("#"):
+            continue
+        try:
+            argv = json.loads(stripped)
+        except ValueError:
+            argv = None  # parse_commands reports it
+        if not (isinstance(argv, list) and all(isinstance(arg, str) for arg in argv)):
+            resolved.append(stripped)
+            continue
+
+        def replace(match):
+            name = match.group(1)
+            if name == "machine":
+                return machine["name"]
+            if name is None or not name.startswith("var:"):
+                return match.group(0)
+            if name[4:] not in machine["vars"]:
+                raise Refusal("command line %d uses {%s}, which [%s] does not define (its vars: %s)" % (
+                    number, name, machine["name"], ", ".join(sorted(machine["vars"])) or "none"))
+            used[name[4:]] = machine["vars"][name[4:]]
+            return used[name[4:]].replace("{", "{{").replace("}", "}}")
+        template.append(argv)
+        resolved.append(json.dumps([core.PLACEHOLDER_RE.sub(replace, arg) for arg in argv]))
+    digest = core.sha256_bytes(core.commands_bytes(template)) if template else None
+    return "\n".join(resolved) + "\n", {"sha256": digest, "vars": dict(sorted(used.items()))}
 
 
 def uses_bin(argv):
@@ -47,8 +83,9 @@ def input_files(specs, roots):
     return files
 
 
-def prepare(args, repo):
-    """Commit, recipe, inputs and commands, checked the same way for submit and try."""
+def prepare(args, repo, machine=None):
+    """Commit, recipe, inputs and commands, checked the same way for submit and try; with a machine,
+    its {var:NAME} and {machine} resolved, and what was resolved (else None)."""
     commit = settings.clean_commit(repo, args.revision)
     config = project.load(repo, commit)
     recipe = project.recipe(config)
@@ -58,6 +95,9 @@ def prepare(args, repo):
         if project.tracked(repo, commit, name):
             raise Refusal("input %s is a file of the revision; inputs may not replace tracked files" % name)
     text = args.commands.read_text() if args.commands else json.dumps(args.command)
+    template = None
+    if machine is not None:
+        text, template = resolve_machine(text, machine)
     try:
         commands = core.parse_commands(text, files, recipe["binary"] is not None)
     except ValueError as error:
@@ -80,7 +120,7 @@ def prepare(args, repo):
     gpus = args.gpus if args.gpus is not None else defaults.get("gpus", 0)
     if gpus < 0:
         raise Refusal("gpus must be 0 or more")
-    return commit, recipe, files, commands, Decimal(str(hours)), vcpus, memory, gpus
+    return commit, recipe, files, commands, Decimal(str(hours)), vcpus, memory, gpus, template
 
 
 def submit_job(aws, queue, name, definition, submission, hours, size, vcpus, memory):
@@ -120,7 +160,7 @@ def main(args):
     path, receipt = None, None
     try:
         values, aws = settings.admit(repo)
-        commit, recipe, files, commands, hours, vcpus, memory_mib, gpus = prepare(args, repo)
+        commit, recipe, files, commands, hours, vcpus, memory_mib, gpus, _ = prepare(args, repo)
         if gpus:
             raise Refusal("the AWS queue has no GPU instances; run commands that need GPUs on a machine "
                           "from .cloudsweep/machines.ini with --on (docs/machines.md)")
@@ -257,7 +297,7 @@ def try_main(args):
     except Refusal:
         values = None
     try:
-        commit, recipe, files, commands, hours, _, _, _ = prepare(args, repo)
+        commit, recipe, files, commands, hours, _, _, _, _ = prepare(args, repo)
         name = project.name(project.load(repo, commit))
         base, base_digest = local_base(name, values)
         root = Path(args.keep) if args.keep else Path(tempfile.mkdtemp(prefix="cloudsweep-try-"))

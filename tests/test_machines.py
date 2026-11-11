@@ -367,6 +367,34 @@ class MachineTests(MachineFixture):
         self.assertIn("cancel on two failed", str(refused.exception))
         self.assertIn("after --wait: a", str(refused.exception))
 
+    def test_variables_resolve_per_machine_and_the_receipt_keeps_them(self):
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("\n[here]\nkind = ssh\nhost = fakehost\nworkdir = %s/here\nslots = 1\n"
+                         "vars = data = /data/a, gpu=H100,\n  odd = x{y}\n" % self.root)
+            stream.write("\n[there]\nkind = ssh\nhost = fakehost\nworkdir = %s/there\nslots = 1\n"
+                         "vars = data=/data/b\n" % self.root)
+        self.sweep.write_text('["sh", "-c", "echo {var:data} {machine} {{var:data}} > {out}/v.txt"]\n')
+        first, _ = self.submit("here")
+        second, _ = self.submit("there")
+        here, there = self.receipt(first), self.receipt(second)
+        self.assertEqual((here["vars"], there["vars"]), ({"data": "/data/a"}, {"data": "/data/b"}))  # those used
+        self.assertEqual(here["template_sha256"], there["template_sha256"])
+        self.assertEqual(here["commands"], [["sh", "-c", "echo /data/a here {{var:data}} > {out}/v.txt"]])
+        self.wait_for_pool(self.root / "there", second)
+        self.assertEqual(self.cli("fetch", second, str(self.root / "results"))[0], 0)
+        self.assertEqual((self.root / "results" / second / "0/1/out/v.txt").read_text(), "/data/b there {var:data}\n")
+        self.sweep.write_text('["sh", "-c", "echo {var:odd} > {out}/v.txt"]\n')
+        third, _ = self.submit("here")  # a value's braces are text, not placeholders
+        self.wait_for_pool(self.root / "here", third)
+        self.assertEqual(self.cli("fetch", third, str(self.root / "results"))[0], 0)
+        self.assertEqual((self.root / "results" / third / "0/1/out/v.txt").read_text(), "x{y}\n")
+        code, out = self.cli("submit", "--on", "there", "--commands", str(self.sweep))
+        self.assertEqual(code, 1)
+        self.assertIn("command line 1 uses {var:odd}, which [there] does not define (its vars: data)", out)
+        (self.repo / ".cloudsweep/machines.ini").write_text("[bad]\nkind = ssh\nvars = 1x=2\n")
+        with self.assertRaisesRegex(project.Refusal, "vars must be NAME=VALUE"):
+            machines.load(self.repo, "bad")
+
     def test_gpu_commands_get_one_slot_per_gpu(self):
         submission, out = self.submit("gpubox", "--gpus", "1")
         self.assertIn("a pool of 2 slot(s) of 1 GPU(s)", out)

@@ -76,6 +76,7 @@ deployment and cannot be a section.
 | `setup` | both | shell lines run first, in your home directory, one per line: module loads, a venv (none) |
 | `container` | both | `apptainer` runs commands in your project's toolchain image, or the path of a `.sif` image already on the machine, such as `~/mirage.sif` ([below](#containers)) (none) |
 | `use` | both | a note on what the machine is for and when to ask before using it; `cloudsweep machines` shows it (none) |
+| `vars` | both | `NAME=VALUE` pairs, comma-separated or one per line, that commands use as `{var:NAME}` ([below](#variables)) (none) |
 | `sbatch`, `cpu_sbatch`, `gpu_sbatch` | slurm | extra `sbatch` options for every job, CPU jobs and GPU jobs: account, partition (none) |
 | `gpu_type` | slurm | GPU type to request, such as `h100` (any) |
 | `slots` | ssh | CPU commands at once (the machine's CPUs ÷ `[run] vcpus`) |
@@ -86,6 +87,31 @@ deployment and cannot be a section.
 it needs and a writable `workdir`; it reports the CPUs of the host it reached and, for an ssh pool,
 its GPUs. It does not submit a job, so it cannot check a cluster's compute nodes, accounts or
 partitions: those show up at `submit`.
+
+## Variables
+
+One job often needs a path or a name that differs between machines: where a venv or a model lives,
+or which GPU to expect. Give each machine its values, and write the command once:
+
+```ini
+[ece-gpu]
+kind = slurm
+vars = venv=/home/me/venvs/serve, gpu=H100
+
+[deltaai]
+kind = slurm
+vars = venv=/projects/bbxx/me/venv, gpu=GH200
+```
+
+```json
+["{var:venv}/bin/python", "check.py", "--gpu", "{var:gpu}", "--machine", "{machine}", "--out", "{out}"]
+```
+
+`{var:NAME}` and `{machine}` (the section's name) are replaced at submission, for the machine the
+submission goes to; the other placeholders stay for the run. A value is used as text: braces in it
+are not placeholders, and `{{var:x}}` stays literal. A command that names a variable its machine
+does not define is refused. The receipt records the variables used (`vars`), the sha256 of the
+commands as written (`template_sha256`) and the commands as resolved (`commands`).
 
 ## Machines that need a password and Duo
 

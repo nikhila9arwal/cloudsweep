@@ -17,6 +17,8 @@ Batch array job, with one child per command. See the [sweep generator](../exampl
 | `{src}` | `/work/src`, the checkout and working directory |
 | `{index}` | command index, starting at 0; useful as a seed |
 | `{input:NAME}` | path of the input named NAME |
+| `{var:NAME}` | on a machine, the value of NAME in its [`vars`](machines.md#variables), replaced at submission |
+| `{machine}` | on a machine, its section's name, replaced at submission |
 | `{{`, `}}` | literal braces |
 
 Pass external files with repeatable `--input PATH[=NAME]`. Without NAME, PATH must be inside the

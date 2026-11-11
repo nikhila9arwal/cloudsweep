@@ -38,7 +38,7 @@ from . import core, engine, fetch, project, settings
 from .project import Refusal
 
 FILE = "machines.ini"
-COMMON = {"kind", "host", "workdir", "setup", "container", "use"}
+COMMON = {"kind", "host", "workdir", "setup", "container", "use", "vars"}
 KEYS = {"slurm": COMMON | {"sbatch", "cpu_sbatch", "gpu_sbatch", "gpu_type"},
         "ssh": COMMON | {"slots", "gpus", "systemd"}}
 GPU_TYPE_RE = re.compile(r"[A-Za-z0-9_.-]+")
@@ -46,6 +46,7 @@ SIF_RE = re.compile(r"(~/|/)[A-Za-z0-9._+@%=,/-]+")  # an image already on the m
 LOCAL = "local"  # as a host: this machine, without ssh; as a machine name: built in, and the default
 AWS = "aws"  # the machine name of the project's AWS Batch deployment, which this module does not run
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+VAR_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]*")
 WORKDIR_RE = re.compile(r"(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._+@%=,/][A-Za-z0-9._+@%=,/-]*")  # unquoted in scripts
 DEFAULT_WORKDIR = "cloudsweep"  # relative paths are relative to the machine's home directory
@@ -160,7 +161,8 @@ def machine(name, section, where, file=None):
                       "the machine, or left out to run in the machine's own environment" % where)
     result = {"name": name, "kind": kind, "host": host, "workdir": workdir, "container": container,
               "file": str(file) if file else None, "use": " ".join(section.get("use", "").split()),
-              "setup": [line.strip() for line in section.get("setup", "").splitlines() if line.strip()]}
+              "setup": [line.strip() for line in section.get("setup", "").splitlines() if line.strip()],
+              "vars": variables(section.get("vars", ""), where)}
     if kind == "slurm":
         for key in ("sbatch", "cpu_sbatch", "gpu_sbatch"):
             result[key] = shlex.split(section.get(key, ""))
@@ -180,6 +182,20 @@ def add_file_argument(parser):
     parser.add_argument("--machines", type=Path, metavar="FILE",
                         help="a machines.ini searched before the project's and yours (a submission's receipt "
                              "records the settings it used, so later commands need no flag)")
+
+
+def variables(text, where):
+    """vars = NAME=VALUE, ... (or one per line): what {var:NAME} gives in this machine's commands."""
+    found = {}
+    for item in re.split(r"[,\n]", text):
+        name, equals, value = (part.strip() for part in item.partition("="))
+        if not item.strip():
+            continue
+        if not equals or not VAR_RE.fullmatch(name) or name in found:
+            raise Refusal("%s: vars must be NAME=VALUE, comma-separated or one per line, each NAME once (a letter "
+                          "or _, then letters, digits or _); a VALUE has no comma: %r" % (where, item.strip()))
+        found[name] = value
+    return found
 
 
 def number(section, key, where, least):
@@ -573,7 +589,7 @@ def submit(args, prepare):
         if args.isolated:
             raise Refusal("--isolated reserves a whole AWS instance; on a machine, request [run] vcpus and "
                           "memory_mib (slurm) or set slots (ssh)")
-        commit, recipe, files_in, commands, hours, vcpus, memory_mib, gpus = prepare(args, repo)
+        commit, recipe, files_in, commands, hours, vcpus, memory_mib, gpus, template = prepare(args, repo, machine)
         if machine["kind"] == "ssh" and gpus and machine["gpus"] == 0:
             raise Refusal("these commands need GPUs; [%s] sets gpus = 0" % machine["name"])
         image = None
@@ -604,7 +620,8 @@ def submit(args, prepare):
         plan = {"submission": submission, "machine": machine["name"], "kind": machine["kind"],
                 "host": machine["host"], "workdir": workdir, "commit": commit, "children": len(commands),
                 "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus, "hours": str(hours), "build": build,
-                "no_build": bool(args.no_build), "image_digest": digest, "machines_file": machine["file"],
+                "no_build": bool(args.no_build), "image_digest": digest, "vars": template["vars"],
+                "template_sha256": template["sha256"], "commands": commands, "machines_file": machine["file"],
                 "section": {key: value for key, value in machine.items() if key != "file"}}
         if machine["container"] and not image:
             plan["container"] = "apptainer; the image is built when you submit"

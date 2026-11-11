@@ -35,6 +35,10 @@
   them, as do `status` and `cancel --all` without `--on` for this host's submissions; `--on MACHINE`
   uses the current files instead. Submissions are grouped by where they run
   (host, workdir, setup), no longer by section name.
+- A machine section's `vars = NAME=VALUE, ...` gives its commands `{var:NAME}`, and `{machine}` its
+  name, both replaced at submission, so one job can run on machines whose paths differ. A value is
+  text (its braces are not placeholders); an undefined variable refuses the submission. The receipt
+  records the variables used, the template's sha256 and the resolved commands.
 
 ## 0.2.2 (2026-11-09)
 
