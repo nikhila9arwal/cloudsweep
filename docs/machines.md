@@ -167,7 +167,8 @@ build runs under QEMU emulation. On Ubuntu, `sudo apt install qemu-user-static` 
 Apptainer installed here, cloudsweep also converts the image to a SIF here; otherwise the machine
 converts the archive it receives. Either way it is uploaded once per image. Only when this host has
 no podman or Docker, or cannot emulate the machine's architecture, does the machine build the image
-itself, with its own podman or Docker.
+itself, with its own podman or Docker. One `[image]` recipe serves every machine with
+`container = apptainer`, so it must build for each of their architectures.
 
 To use an image that already exists on the machine instead, give its path, absolute or starting
 with `~/` (without spaces): `container = ~/mirage.sif`. cloudsweep mounts its worker into it, so the
