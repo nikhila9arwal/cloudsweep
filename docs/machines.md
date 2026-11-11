@@ -246,6 +246,11 @@ charges per unit is the site's rule, which Slurm does not state; the GPU-hours `
 counted from what Slurm allocated, not from the charge. For a rule cloudsweep does not apply (a
 variant of `MAX_TRES` in `PriorityFlags` other than `MAX_TRES` itself), it reports the units as unknown.
 
+The same call reads the partition's `MaxTime`. When the job's time limit (`--hours`, which sbatch
+gets in whole minutes) exceeds it, the dry run and `submit` warn, since Slurm would leave the job
+pending with reason `PartitionTimeLimit`; the receipt records it (`max_time`, `time_warning`). It is
+a warning, not a refusal.
+
 ## Containers
 
 By default commands use the machine's own software. Add `container = apptainer` to a machine's

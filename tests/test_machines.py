@@ -125,8 +125,8 @@ elif sys.argv[1:] == ["show", "config"]:
         sys.stdout.write("PriorityFlags           = %s\\n" % open(os.path.join(here, "flags.txt")).read().strip())
 """
 PARTITIONS = """PartitionName=cpu AllowGroups=ALL Default=YES QoS=N/A TRES=cpu=848,mem=7893156M,node=7,billing=848
-PartitionName=gpu AllowGroups=ALL Default=NO TRESBillingWeights=CPU=13.888888,Mem=9.01726G,GRES/gpu=1000
-PartitionName=gpu-short AllowGroups=ALL Default=NO TRESBillingWeights=CPU=27.777776,Mem=18.03452G,GRES/gpu=2000
+PartitionName=gpu AllowGroups=ALL Default=NO MaxTime=2-00:00:00 TRESBillingWeights=CPU=13.888888,Mem=9.01726G,GRES/gpu=1000
+PartitionName=gpu-short AllowGroups=ALL Default=NO MaxTime=02:00:00 TRESBillingWeights=CPU=27.777776,Mem=18.03452G,GRES/gpu=2000
 """
 
 
@@ -862,6 +862,10 @@ class SlurmTests(MachineFixture):
                                           "--commands", str(self.sweep), "--input", "trace.bin")
         self.assertEqual(code, 0, err)
         self.assertIn("gave no PriorityFlags", json.loads(out)["billing"][0]["error"])
+        code, out, err = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--gpus", "1", "--hours",
+                                          "3", "--partition", "gpu-short", "--commands", str(self.sweep), "--input",
+                                          "trace.bin")
+        self.assertIn("the time limit is 02:00:00", json.loads(out)["billing"][0]["time_warning"])  # still read
 
     def test_a_dry_run_shows_the_partition_s_billing_and_warns_above_a_gpu_s_share(self):
         code, out, err = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--gpus", "1",
@@ -892,6 +896,13 @@ class SlurmTests(MachineFixture):
         self.assertEqual(plan["sbatch"][-3:-1], ["--partition=gpu", "--partition=gpu-short"])  # the last wins
         self.assertEqual((plan["partition"], plan["billing"][0]["partition"], plan["billing"][0]["units"]),
                          ("gpu-short", "gpu-short", 2000))
+        self.assertNotIn("time_warning", plan["billing"][0])  # 0.1 h fits in 2 h
+        code, out, err = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--gpus", "1",
+                                          "--hours", "3", "--partition", "gpu-short", "--commands", str(self.sweep),
+                                          "--input", "trace.bin")
+        self.assertEqual(code, 0, err)  # a warning, not a refusal
+        self.assertIn("warning: on gpu-short the time limit is 02:00:00 (MaxTime)", err)
+        self.assertEqual(json.loads(out)["billing"][0]["max_time"], "02:00:00")
         submission, _ = self.submit("cluster", "--partition", "gpu-short")
         sent = [line for line in self.log.read_text().splitlines() if line.startswith("sbatch")][-1]
         self.assertTrue(sent.endswith('"--partition=cpu", "--partition=gpu-short"]'), sent)  # a CPU job here
@@ -991,6 +1002,16 @@ class BillingTests(unittest.TestCase):
     def test_rules_cloudsweep_does_not_know_are_not_guessed(self):
         self.assertIn("does not apply", machines.billing_units(self.BATCH, "MAX_TRES_GRES", self.request())["error"])
         self.assertIn("cannot read", machines.billing_units("CPU=1K", "", self.request())["error"])
+
+    def test_a_time_limit_above_the_partition_s_is_warned_about(self):
+        self.assertEqual([machines.slurm_seconds(text) for text in ("02:00:00", "2-00:00:00", "30:00", "45",
+                                                                     "UNLIMITED", "", None)],
+                         [7200, 172800, None, None, None, None, None])
+        self.assertEqual(machines.time_limit("02:00:00", 7200, "short"), {"max_time": "02:00:00"})
+        found = machines.time_limit("02:00:00", 7201, "short")  # sbatch asks in whole minutes: 2:01:00
+        self.assertIn("the job asks for 2:01:00 (--hours), so Slurm would leave it pending with reason "
+                      "PartitionTimeLimit", found["time_warning"])
+        self.assertEqual(machines.time_limit("UNLIMITED", 10 ** 6, "long"), {"max_time": "UNLIMITED"})
 
     def test_the_request_includes_the_sections_sbatch_options(self):
         job = {"vcpus": 1, "memory_mib": 3500, "gpus": 1, "gpu_type": "h100",

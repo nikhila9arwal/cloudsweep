@@ -65,6 +65,9 @@
   variables), with no GPU and no checkout, within a time limit enforced on the machine; output
   streams and its exit code is the command's. A missing bind refuses it. A submission with
   `container = apptainer` now records its image's key, platform and recipe hash, which `exec` uses.
+- The dry run and `submit` on a Slurm machine warn when `--hours` exceeds the partition's `MaxTime`
+  (2 h on DeltaAI's `ghx4-interactive`), where Slurm would leave the job pending with reason
+  `PartitionTimeLimit`, and record it beside the billing in the receipt. It is not a refusal.
 
 ## 0.2.2 (2026-11-09)
 

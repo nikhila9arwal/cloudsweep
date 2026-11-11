@@ -559,10 +559,8 @@ def slurm_billing(machine, job):
         if line.startswith("PartitionName="):
             fields = settings_line(line)
             found[fields["PartitionName"]] = fields
-    if not config.strip().lower().startswith("priorityflags"):  # not read: its rule cannot be applied
-        return [{"partition": name, "error": "scontrol show config gave no PriorityFlags (exit %d)" % done.returncode}
-                for name in partitions or [None]]
-    flags = (config.strip().partition("=")[2]).strip()
+    read = config.strip().lower().startswith("priorityflags")  # if not, its billing rule cannot be applied
+    flags = (config.strip().partition("=")[2]).strip() if read else None
     default = partitions is None
     if default:
         partitions = [name for name, fields in found.items() if fields.get("Default") == "YES"][:1] or [None]
@@ -573,14 +571,43 @@ def slurm_billing(machine, job):
                          % (name or "marked Default", done.returncode)})
             continue
         weights = found[name].get("TRESBillingWeights")
-        row = dict(billing_units(weights, flags, request), partition=name, default=default, weights=weights,
-                   priority_flags=flags, request=request)
+        units = billing_units(weights, flags, request) if read else {
+            "error": "scontrol show config gave no PriorityFlags (exit %d)" % done.returncode}
+        row = dict(units, partition=name, default=default, weights=weights, priority_flags=flags, request=request)
         if "error" not in row:
             row.update(gpu_share(row, request))
             if uncounted:
                 row["notes"] = row["notes"] + ["not counted: sbatch %s" % " ".join(uncounted)]
+        row.update(time_limit(found[name].get("MaxTime"), job["seconds"], name))
         rows.append(row)
     return rows
+
+
+def slurm_seconds(text):
+    """A Slurm time as scontrol prints it ([DAYS-]HOURS:MINUTES:SECONDS), in seconds; None for
+    UNLIMITED, INFINITE or anything else, never guessed."""
+    days, _, clock_ = (text or "").rpartition("-")
+    parts = clock_.split(":")
+    if not (days == "" or days.isdigit()) or len(parts) != 3 or not all(part.isdigit() for part in parts):
+        return None
+    seconds = 0
+    for part in parts:
+        seconds = seconds * 60 + int(part)
+    return seconds + 86400 * int(days or 0)
+
+
+def time_limit(text, seconds, partition):
+    """The partition's MaxTime, and a warning when the job's time limit (sbatch --time, in whole
+    minutes) exceeds it: Slurm would then leave the job pending with reason PartitionTimeLimit."""
+    limit = slurm_seconds(text)
+    if not text:
+        return {}
+    found = {"max_time": text}
+    asked = -(-seconds // 60) * 60
+    if limit is not None and asked > limit:
+        found["time_warning"] = ("on %s the time limit is %s (MaxTime); the job asks for %s (--hours), so Slurm would "
+                                 "leave it pending with reason PartitionTimeLimit" % (partition, text, clock(asked)))
+    return found
 
 
 def billing_text(row):
@@ -750,8 +777,8 @@ def submit(args, prepare):
             plan["sbatch"] = ["sbatch"] + job["sbatch"] + ["jobs/%s/job.sh" % submission]
             plan["billing"] = slurm_billing(machine, job)
             for row in plan["billing"]:
-                print(billing_text(row) + ("\nwarning: " + row["warning"] if row.get("warning") else ""),
-                      file=sys.stderr, flush=True)
+                print(billing_text(row) + "".join("\nwarning: " + row[key] for key in ("warning", "time_warning")
+                                                  if row.get(key)), file=sys.stderr, flush=True)
         else:
             job.update(slots=machine["slots"], machine_gpus=machine["gpus"], systemd=machine["systemd"])
             plan["slots"] = ("one per %d GPU(s)" % gpus if gpus else machine["slots"] or
