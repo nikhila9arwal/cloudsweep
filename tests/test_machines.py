@@ -671,6 +671,22 @@ class ContainerTests(MachineFixture):
         self.assertRegex(self.cli("doctor", "--on", "given")[1], r"image +-- +given has no image")
         self.assertFalse((self.root / "given/images").exists() and any((self.root / "given/images").iterdir()))
 
+    def test_a_dry_run_names_the_machine_s_image_and_the_build_a_submission_uses(self):
+        self.given_image()
+        code, out, err = self.cli_streams("submit", "--on", "given", "--dry-run", "--json", "--commands",
+                                          str(self.sweep), "--input", "trace.bin")
+        self.assertEqual(code, 0, err)
+        plan = json.loads(out)
+        self.assertEqual(plan["container"], "apptainer, the machine's image %s" % (self.root / "given.sif"))
+        submission, _ = self.submit("given")
+        self.assertEqual((self.receipt(submission)["build"], self.receipt(submission)["image_digest"]),
+                         (plan["build"], plan["image_digest"]))
+        (self.root / "given.sif").unlink()  # the submission would refuse, so the dry run does
+        code, out = self.cli("submit", "--on", "given", "--dry-run", "--commands", str(self.sweep), "--input",
+                             "trace.bin")
+        self.assertEqual(code, 1, out)
+        self.assertIn("given has no image", out)
+
     def test_an_image_replaced_after_its_submission_is_refused(self):
         self.given_image()
         found = machines.existing_image

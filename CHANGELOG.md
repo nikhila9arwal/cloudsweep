@@ -10,6 +10,10 @@
   each task's state, start, end, elapsed time, node, allocated GPUs and billing units (for a
   requeued task, each execution's), with the GPU-hours and billing unit-hours summed (`accounting` in `status --json` and in `fetch.json`).
   The final record is kept on the machine. A cluster without accounting still shows the queue.
+- **Changed:** a dry run on a machine whose section names an image already there
+  (`container = PATH.sif`) now reads that image, as a submission does, so its build and image
+  identity match the submission's; a missing image is refused. Earlier it said the image is
+  built when you submit.
 - `submit --json` on a machine prints one JSON object: the receipt, which has every field of the
   dry run, with its path. `submit --dry-run --json` prints the plan with the batch script in it.
 

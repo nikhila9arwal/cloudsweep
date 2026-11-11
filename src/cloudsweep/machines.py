@@ -402,8 +402,8 @@ def submit(args, prepare):
         if machine["kind"] == "ssh" and gpus and machine["gpus"] == 0:
             raise Refusal("these commands need GPUs; [%s] sets gpus = 0" % machine["name"])
         image = None
-        if machine["container"] and machine["container"] != "apptainer" and not args.dry_run:
-            image = existing_image(machine)
+        if machine["container"] and machine["container"] != "apptainer":
+            image = existing_image(machine)  # read only, so a dry run resolves it too: the build depends on it
         elif machine["container"] and not args.dry_run:
             arch = ssh(machine, "uname -m").stdout.split()
             target = PLATFORM_OF.get(arch[-1] if arch else "")

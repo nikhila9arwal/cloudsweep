@@ -46,8 +46,9 @@ cloudsweep submit --on aws --commands sweep.jsonl --input traces/a.txt
 
 Without `--on`, `submit` runs on this host; `--on MACHINE` runs on [your own machine](machines.md)
 and `--on aws` on AWS Batch. **AWS runs cost money.** `--dry-run` checks and plans without
-building, uploading or submitting; on AWS it prints the estimate. See
-[costs and limits](admin.md#costs-and-limits) for the estimate, ceiling and billing gaps.
+building, uploading or submitting; on AWS it prints the estimate. On a machine it only reads the
+image already there (`container = PATH.sif`). See [costs and limits](admin.md#costs-and-limits)
+for the AWS estimate, ceiling and billing gaps.
 
 | Option | Meaning |
 |---|---|
