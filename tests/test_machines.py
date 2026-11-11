@@ -354,18 +354,18 @@ class MachineTests(MachineFixture):
                 raise project.Refusal("cancel on two failed: no answer")
             return {s: "stop requested" for s in submissions}
 
-        def call_status(machine, *submissions):
+        def poll_rows(machine, submissions, deadline):
             clock[0] += 40  # each poll takes a while; "one" is never seen to stop
-            return {s: {"state": "RUNNING" if machine["name"] == "one" else "CANCELLED"} for s in submissions}
+            return {} if machine["name"] == "one" else {s: {"state": "CANCELLED"} for s in submissions}
         args = mock.Mock(submission=None, wait=1)
-        with mock.patch.object(machines, "call", call), mock.patch.object(machines, "call_status", call_status), \
+        with mock.patch.object(machines, "call", call), mock.patch.object(machines, "poll_rows", poll_rows), \
                 mock.patch.object(machines.time, "monotonic", lambda: clock[0]), \
                 mock.patch.object(machines.time, "sleep"), redirect_stdout(io.StringIO()):
             with self.assertRaises(project.Refusal) as refused:
                 machines.cancel(args, [(first, ["a"]), (second, ["b"]), (third, ["c"])])
         self.assertEqual([entry[0] for entry in asked], ["one", "two", "three"])  # all sent before the wait
         self.assertIn("cancel on two failed", str(refused.exception))
-        self.assertIn("after --wait: a", str(refused.exception))
+        self.assertIn("not seen to stop, after --wait: a", str(refused.exception))
 
     def test_variables_resolve_per_machine_and_the_receipt_keeps_them(self):
         with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
@@ -442,6 +442,96 @@ class MachineTests(MachineFixture):
         self.assertEqual(code, 1)
         self.assertIn("child 0: terminated", out)
         self.assertIn("child 3: no attempt yet", out)
+
+    def test_a_pool_that_ends_while_its_status_is_read_keeps_its_end(self):
+        self.sweep.write_text('["true"]\n')
+        submission, _ = self.submit("box")
+        final = self.wait_for_pool(self.root / "box", submission)
+        site = remote.Site(self.root / "box", submission)
+        path = site.dir / "state.json"
+        path.write_text(json.dumps({k: v for k, v in final.items() if k != "finished"}))  # as first read
+
+        def ends(site, state):  # the pool writes its end and exits just after that read
+            path.write_text(json.dumps(final))
+            return False
+        with mock.patch.object(remote, "pool_alive", ends):
+            report = remote.site_status(site)
+        self.assertEqual((report["state"], report["finished"]), ("FINISHED", final["finished"]))
+        self.assertNotIn("orphans", report)
+
+    def test_a_pool_whose_supervisor_died_reports_and_stops_its_commands(self):
+        self.sweep.write_text('["sh", "-c", "sleep 60"]\n' * 2)
+        submission, _ = self.submit("box")
+        started = self.root / "box/store/runs" / submission / "0" / "1" / "started.json"
+        for _ in range(80):
+            if started.is_file():
+                break
+            time.sleep(0.25)
+        state = json.loads((self.root / "box/jobs" / submission / "state.json").read_text())
+        row = json.loads(self.cli_streams("status", "--json", submission)[1])[submission]
+        self.assertEqual((row["state"], row["started"], row["finished"]), ("RUNNING", state["started"], None))
+        os.kill(state["pid"], 9)  # the supervisor dies; its commands do not
+        for _ in range(40):
+            row = json.loads(self.cli_streams("status", "--json", submission)[1])[submission]
+            if row["state"].startswith("STOPPED"):
+                break
+            time.sleep(0.25)
+        self.assertEqual(row["orphans"], 2)
+        real_sleep = time.sleep
+        with mock.patch("time.sleep", lambda seconds: real_sleep(min(seconds, 0.25))):
+            code, out = self.cli("cancel", submission, "--wait", "1")  # waits for the orphaned commands too
+        self.assertEqual(code, 0, out)
+        self.assertIn("stop requested (2 command(s) of a pool that ended early)", out)
+        row = json.loads(self.cli_streams("status", "--json", submission)[1])[submission]
+        self.assertEqual(row["orphans"], 0)
+
+    def test_a_remote_call_s_time_limit_covers_uploading_the_code(self):
+        machine = machines.load(self.repo, "box")
+        limits = []
+
+        def ssh(machine, script, timeout=None):
+            limits.append(timeout)
+            return mock.Mock(returncode=machines.MISSING_CODE if len(limits) == 1 else 0, stdout="")
+        with mock.patch.object(machines, "ssh", ssh), \
+                mock.patch.object(machines, "rsync", lambda *args, timeout=None: limits.append(timeout)):
+            with self.assertRaises(project.Refusal):
+                machines.call(machine, "status", timeout=30)
+        self.assertEqual(len(limits), 4)  # the call, mkdir, rsync and the retry
+        self.assertTrue(all(limit is not None and limit <= 30 for limit in limits), limits)
+
+    def test_waiting_retries_a_machine_that_does_not_answer_and_keeps_to_its_deadline(self):
+        machine, limits = machines.load(self.repo, "box"), []
+        rows = [project.Refusal("box did not answer within 5 s"), {"s": {"state": "UNKNOWN"}},
+                {"s": {"state": "RUNNING"}}, {"s": {"state": "FINISHED"}}]
+
+        def status(machine, *submissions, timeout=None):
+            limits.append(timeout)
+            row = rows.pop(0)
+            if isinstance(row, Exception):
+                raise row
+            return row
+        with mock.patch.object(machines, "call_status", status), mock.patch("time.sleep") as sleep, \
+                mock.patch("sys.stderr"), redirect_stdout(io.StringIO()):
+            self.assertEqual(machines.wait_for(machine, "s", 10)["state"], "FINISHED")
+        self.assertTrue(all(5 <= limit <= machines.CALL_LIMIT for limit in limits), limits)
+        self.assertTrue(all(call.args[0] <= 60 for call in sleep.call_args_list))
+
+    def test_no_remote_call_is_made_once_the_deadline_has_passed(self):
+        self.assertEqual(machines.call_limit(None), machines.CALL_LIMIT)
+        self.assertEqual(machines.call_limit(time.monotonic() - 1), 0)
+        self.assertLessEqual(machines.call_limit(time.monotonic() + 2), 2)
+        with mock.patch.object(machines, "call_status", side_effect=AssertionError("called after the deadline")):
+            self.assertEqual(machines.poll_rows(machines.load(self.repo, "box"), ["s"], time.monotonic() - 1), {})
+
+    def test_a_call_gives_ssh_only_the_time_left(self):
+        limits = []
+
+        def ssh(machine, script, timeout=None):
+            limits.append(timeout)
+            return mock.Mock(returncode=0, stdout=machines.RESULT + '{"s": {}}\n')
+        with mock.patch.object(machines, "ssh", ssh):
+            machines.call(machines.load(self.repo, "box"), "status", "s", timeout=0.05)
+        self.assertTrue(0 < limits[0] <= 0.05, limits)
 
     def test_a_submission_that_never_started_is_reported_cancelled_and_fetched(self):
         submission, out = self.submit("broken", expect=1)  # its setup line fails before anything starts
@@ -660,6 +750,34 @@ class SlurmTests(MachineFixture):
         code, out = self.cli("status", submission)
         self.assertIn("Slurm accounting: 3 COMPLETED, 2 REQUEUED; elapsed 0:02:21 in all", out)
         self.assertTrue((self.root / "cluster/jobs" / submission / "accounting.json").exists())  # final
+
+    def test_accounting_is_read_on_request_while_every_task_waits(self):
+        submission = self.held()
+        (self.slurm / "queue.txt").write_text("0|PENDING|BeginTime|N/A||\n1|PENDING|Priority|N/A||\n"
+                                              "2|PENDING|Priority|N/A||\n")
+        (self.slurm / "accounting.txt").write_text(  # task 0 ran, then Slurm requeued it
+            "4242_0|REQUEUED|{t:%d}|{t:%d}|6|node04|cpu|billing=2,cpu=2,node=1|0:0\n" % (
+                utc(2026, 11, 11, 22, 9, 27), utc(2026, 11, 11, 22, 9, 33)))
+        machine = machines.load(self.repo, "cluster")
+        self.assertNotIn("accounting", machines.call_status(machine, submission)[submission])
+        row = machines.call_status(machine, submission, accounting=True, timeout=60)[submission]
+        self.assertEqual(([task["state"] for task in row["accounting"]["tasks"]], row["accounting"]["final"]),
+                         (["REQUEUED"], False))
+
+    def test_a_command_that_ends_during_the_poll_is_counted_as_it_ended(self):
+        submission = self.held()
+        site = remote.Site(self.root / "cluster", submission)
+        real = remote.slurm_queue
+
+        def finish(job):  # every task ends while squeue is asked
+            for index in range(3):
+                attempt = site.store / "runs" / submission / str(index) / "1"
+                attempt.mkdir(parents=True, exist_ok=True)
+                (attempt / "manifest.json").write_text(json.dumps({"status": "succeeded"}))
+            return real(job)
+        with mock.patch.object(remote, "slurm_queue", finish), mock.patch.dict(os.environ, PATH=os.environ["PATH"]):
+            report = remote.site_status(site)
+        self.assertEqual((report["state"], report["children"]), ("FINISHED", {"succeeded": 3}))
 
     def test_status_works_when_sacct_does_not(self):
         submission = self.held()

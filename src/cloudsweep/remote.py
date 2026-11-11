@@ -436,7 +436,16 @@ def stop(site):
         (site.dir / "cancelled").touch()
         return "stop requested (scancel %s)" % job
     if state and not pool_alive(site, state):
-        return "not running"
+        stray = orphans(site) if "finished" not in state else []
+        for pid in stray:  # the pool's supervisor died; its commands still run
+            try:
+                os.kill(pid, signal.SIGTERM)  # each stops its worker, which uploads what it has
+            except OSError:
+                pass
+        if not stray:
+            return "not running"
+        (site.dir / "cancelled").touch()
+        return "stop requested (%d command(s) of a pool that ended early)" % len(stray)
     (site.dir / "cancelled").touch()
     if not state:
         return "stop recorded; it will not start"
@@ -741,8 +750,35 @@ def child_state(status, queued, pool_active):
     return "not run" if status is NO_ATTEMPT else status
 
 
-def site_status(site):
-    state, statuses = site.state(), latest_statuses(site)
+def accounting_final(accounting, count):
+    """Whether sacct's record is complete and final: every task's last execution has ended."""
+    latest = {}
+    for task in accounting.get("tasks") or []:
+        latest[task["task"]] = task  # a task's last execution decides whether it has ended
+    return sorted(latest) == list(range(count)) and all(task["state"] in SLURM_ENDED for task in latest.values())
+
+
+def orphans(site):
+    """Process ids of this submission's commands still running although its pool has ended (the
+    pool's supervisor died; its commands, each `remote.py child ROOT SUBMISSION INDEX`, did not)."""
+    found = []
+    for entry in os.listdir("/proc") if os.path.isdir("/proc") else []:
+        if not entry.isdigit():
+            continue
+        try:
+            with open("/proc/%s/cmdline" % entry, "rb") as stream:
+                argv = stream.read().split(b"\0")
+        except OSError:
+            continue
+        if b"child" in argv and site.submission.encode() in argv and any(arg.endswith(b"remote.py") for arg in argv):
+            found.append(int(entry))
+    return found
+
+
+def site_status(site, accounting=False):
+    """What one submission is doing. With accounting, a Slurm job's accounting is read even while
+    every task is pending (a task can have run and been requeued)."""
+    state = site.state()
     report = {"kind": site.job["kind"], "commands": site.job["count"]}
     pool_active, queued = False, {}
     if site.job["kind"] == "slurm":
@@ -754,21 +790,28 @@ def site_status(site):
                                       "PENDING" if active else "FINISHED"))
         if tasks:
             report["queue"] = [dict(task=index, **tasks[index]) for index in sorted(tasks)]
-        if job and (len(tasks) < site.job["count"] or any(t["state"] != "PENDING" for t in tasks.values())):
+        if job and (accounting or len(tasks) < site.job["count"] or any(t["state"] != "PENDING" for t in tasks.values())):
             # Some task has started or ended: sacct accounts for it (final once none is queued).
             report["accounting"] = (final_accounting(site, job, site.job["count"]) if not tasks
                                     else slurm_accounting(job))
+            report["accounting"]["final"] = not tasks and accounting_final(report["accounting"], site.job["count"])
         started = bool(job)
     else:
         if state.get("host") and state["host"] != socket.gethostname():
             report.update(state="UNKNOWN (the pool runs on %s, not here)" % state["host"])
             return report
         active = pool_active = pool_alive(site, state)
+        if not active:  # it may have written its end and exited since state was read
+            state = site.state()
         if active:
             queued = {index: "RUNNING" for index in read_json(site.dir / "running.json") or []}
         report.update(job=state.get("pid"), state=("RUNNING" if active else "FINISHED" if "finished" in state
-                                                   else "STOPPED (the pool ended early; see pool.log)"))
+                                                   else "STOPPED (the pool ended early; see pool.log)"),
+                      started=state.get("started"), finished=state.get("finished"))
+        if state and not active and "finished" not in state:
+            report["orphans"] = len(orphans(site))  # commands of a dead pool may still run
         started = bool(state)
+    statuses = latest_statuses(site)  # after the scheduler: a command that ends meanwhile has its manifest
     if not started and not statuses:
         report["state"] = "NOT STARTED (its submit did not finish; see the receipt)"
     unfinished = len(statuses) < site.job["count"] or any(status != "succeeded" for status in statuses.values())
@@ -783,10 +826,11 @@ def site_status(site):
 
 
 def status(root, submissions):
+    accounting = submissions[:1] == ["--accounting"]
     report = {}
-    for submission in submissions:
+    for submission in submissions[1:] if accounting else submissions:
         try:
-            report[submission] = site_status(Site(root, submission))
+            report[submission] = site_status(Site(root, submission), accounting)
         except (OSError, ValueError, KeyError) as error:
             report[submission] = {"state": "UNKNOWN", "error": str(error)}
     emit(report)

@@ -65,6 +65,7 @@ BINFMT = Path("/proc/sys/fs/binfmt_misc")
 # with the machine's Python, since stat's formats differ between coreutils implementations.
 STAMP = "import os, sys; s = os.stat(os.path.expanduser(sys.argv[1])); print('%d:%d' % (s.st_size, s.st_mtime_ns))"
 SIGNAL_SECONDS = 120  # Slurm sends SIGTERM this long before the time limit, so the worker can upload
+CALL_LIMIT = 120  # seconds a machine has to answer one poll of a --wait
 # A build on a Slurm machine runs on its shared login node; by default it may use this many CPUs.
 SLURM_BUILD_CPUS = 8
 
@@ -591,16 +592,19 @@ def at(machine, path):
     return path if machine["host"] == LOCAL else "%s:%s" % (machine["host"], path)
 
 
-def ssh(machine, script):
+def ssh(machine, script, timeout=None):
     """Run script in a bash login shell on the machine (so module and similar setup commands work
-    there), in its home directory; its stderr streams here. Returns the process, stdout captured."""
+    there), in its home directory; its stderr streams here. Returns the process, stdout captured.
+    With a timeout (seconds), a machine that does not answer in time is refused."""
     argv = ["bash", "-lc", script] if machine["host"] == LOCAL else ["ssh", machine["host"],
                                                                     "bash -lc " + shlex.quote(script)]
     try:
         done = subprocess.run(argv, stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, universal_newlines=True,
-                              cwd=str(Path.home()))
+                              cwd=str(Path.home()), timeout=timeout)
     except FileNotFoundError:
         raise Refusal("%s is not installed or not on PATH" % argv[0])
+    except subprocess.TimeoutExpired:
+        raise Refusal("%s did not answer within %d s" % (machine["name"], timeout))
     if done.returncode == 255 and machine["host"] != LOCAL:
         raise Refusal("ssh %s failed (connection or sign-in). A machine that needs a password and Duo needs an "
                       "open ControlMaster connection first: run `ssh %s` with ControlMaster and ControlPersist "
@@ -608,11 +612,13 @@ def ssh(machine, script):
     return done
 
 
-def rsync(*args):
+def rsync(*args, timeout=None):
     try:
-        done = subprocess.run(["rsync"] + list(args), stdin=subprocess.DEVNULL, cwd=str(Path.home()))
+        done = subprocess.run(["rsync"] + list(args), stdin=subprocess.DEVNULL, cwd=str(Path.home()), timeout=timeout)
     except FileNotFoundError:
         raise Refusal("rsync is not installed or not on PATH")
+    except subprocess.TimeoutExpired:
+        raise Refusal("rsync did not finish within %d s" % timeout)
     if done.returncode:
         raise Refusal("rsync failed (exit %d); see the messages above" % done.returncode)
 
@@ -624,22 +630,36 @@ def write_code(tree, files_code):
         (directory / name).write_bytes(data)
 
 
-def call(machine, action, *args):
+def upload_code(machine, files_code, left=lambda: None):
+    """This version's remote code into workdir/code/, where call and exec run it."""
+    with tempfile.TemporaryDirectory(prefix="cloudsweep-") as scratch:
+        write_code(Path(scratch), files_code)
+        if ssh(machine, "mkdir -p -m 700 %s" % machine["workdir"], left()).returncode:
+            raise Refusal("could not create %s on %s" % (machine["workdir"], machine["name"]))
+        rsync("-a", scratch + "/code/", at(machine, machine["workdir"] + "/code/"), timeout=left())
+
+
+def call(machine, action, *args, timeout=None):
     """Run remote.py ACTION on the machine and return its result, first uploading this version of
-    the remote code if workdir lacks it."""
+    the remote code if workdir lacks it; each ssh call within timeout seconds, if given."""
     files_code = code_files()
     program = "%s/code/%s/remote.py" % (machine["workdir"], code_hash(files_code))
     script = "\n".join(["[ -f %s ] || exit %d" % (program, MISSING_CODE), "set -e"] + machine["setup"] +
                        ["exec python3 %s %s %s %s" % (program, action, machine["workdir"],
                                                       " ".join(shlex.quote(arg) for arg in args))])
-    done = ssh(machine, script)
+    deadline = None if timeout is None else time.monotonic() + timeout
+
+    def left():  # one budget for the call, the code's upload and the retry
+        if deadline is None:
+            return None
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise Refusal("%s did not answer within %d s" % (machine["name"], timeout))
+        return remaining
+    done = ssh(machine, script, left())
     if done.returncode == MISSING_CODE:
-        with tempfile.TemporaryDirectory(prefix="cloudsweep-") as scratch:
-            write_code(Path(scratch), files_code)
-            if ssh(machine, "mkdir -p -m 700 %s" % machine["workdir"]).returncode:
-                raise Refusal("could not create %s on %s" % (machine["workdir"], machine["name"]))
-            rsync("-a", scratch + "/code/", at(machine, machine["workdir"] + "/code/"))
-        done = ssh(machine, script)
+        upload_code(machine, files_code, left)
+        done = ssh(machine, script, left())
     found = [line[len(RESULT):] for line in done.stdout.splitlines() if line.startswith(RESULT)]
     result = json.loads(found[-1]) if found else None
     if done.returncode or not isinstance(result, dict) or "error" in result:
@@ -999,9 +1019,11 @@ def describe(submission, row):
     return line + ("\n    " + accounting_text(row["accounting"]) if row.get("accounting") else "")
 
 
-def call_status(machine, *submissions):
-    """remote.py status, with the sums of each Slurm submission's accounting added."""
-    report = call(machine, "status", *submissions)
+def call_status(machine, *submissions, accounting=False, timeout=None):
+    """remote.py status, with the sums of each Slurm submission's accounting added; with accounting,
+    the accounting is read even while every task is pending."""
+    report = call(machine, "status", *((["--accounting"] if accounting else []) + list(submissions)),
+                  timeout=timeout)
     for row in report.values():
         if isinstance(row, dict) and isinstance(row.get("accounting"), dict):
             row["accounting"] = with_totals(row["accounting"])
@@ -1050,17 +1072,18 @@ def cancel(args, groups):
     while args.wait and sent:
         busy = []
         for machine, wanted in sent:
-            found = call_status(machine, *wanted)
-            left = [s for s in wanted if found.get(s, {}).get("state") in ACTIVE]
+            found = poll_rows(machine, wanted, deadline)
+            left = [s for s in wanted if not stopped(found.get(s, {}))]
             if left:
                 busy.append((machine, left))
         sent = busy
         if not sent:
             break
         if time.monotonic() > deadline:
-            refusals.append("still running after --wait: %s" % ", ".join(s for _, left in sent for s in left))
+            refusals.append("still running, or not seen to stop, after --wait: %s"
+                            % ", ".join(s for _, left in sent for s in left))
             break
-        time.sleep(30)
+        time.sleep(max(0, min(30, deadline - time.monotonic())))
     if refusals:
         raise Refusal("; ".join(refusals))
     return 1 if failed else 0
@@ -1088,17 +1111,46 @@ class Fetched(core.LocalStore):
         return [(key, size) for key, size in self.listing if key.startswith(prefix)]
 
 
+def call_limit(deadline=None):
+    """The seconds one remote call of a poll may take: CALL_LIMIT, or less before a deadline; 0 once
+    the deadline has passed, when no call is made."""
+    if deadline is None:
+        return CALL_LIMIT
+    return max(0, min(CALL_LIMIT, deadline - time.monotonic()))
+
+
+def poll_rows(machine, submissions, deadline):
+    """status within the time left before the deadline (at most CALL_LIMIT s); {} when the machine
+    does not answer, which a waiting caller takes as not known yet, never as done."""
+    limit = call_limit(deadline)
+    if not limit:
+        return {}
+    try:
+        return call_status(machine, *submissions, timeout=limit)
+    except Refusal as error:
+        print("no answer from %s: %s" % (machine["name"], error), file=sys.stderr, flush=True)
+        return {}
+
+
+def stopped(row):
+    """Whether a status row shows nothing of the submission running: it left the queue, or its
+    pool ended and no command of it is left (an unknown row is not)."""
+    state = str(row.get("state", "UNKNOWN"))
+    return not state.startswith("UNKNOWN") and state not in ACTIVE and not row.get("orphans")
+
+
 def wait_for(machine, submission, minutes):
     """Poll the submission until its job leaves the queue or its pool ends, at most minutes long."""
     deadline = time.monotonic() + 60 * minutes
     while True:
-        row = call_status(machine, submission).get(submission, {})
-        print(describe(submission, row).strip(), flush=True)
-        if row.get("state") not in ACTIVE:
-            return row
+        row = poll_rows(machine, [submission], deadline).get(submission)
+        if row:
+            print(describe(submission, row).strip(), flush=True)
+            if stopped(row):
+                return row
         if time.monotonic() > deadline:
-            raise Refusal("still %s after --wait %d minutes" % (row.get("state"), minutes))
-        time.sleep(60)
+            raise Refusal("still %s after --wait %d minutes" % ((row or {}).get("state", "not known"), minutes))
+        time.sleep(max(0, min(60, deadline - time.monotonic())))
 
 
 def fetch_results(args, machine):
