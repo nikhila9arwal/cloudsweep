@@ -290,10 +290,10 @@ def route(parser, args):
     """Without --on, run on this host; --on aws takes the AWS path, any other name a machine."""
     check_command_args(parser, args)
     if args.on == machines.AWS:
-        for flag, given in (("--json", args.json), ("--no-build", args.no_build)):
+        for flag, given in (("--json", args.json), ("--no-build", args.no_build), ("--machines", args.machines)):
             if given:
-                raise Refusal("%s is for machines; on AWS the revision image is always built, and submit prints "
-                              "text (its receipt is JSON)" % flag)
+                raise Refusal("%s is for machines; on AWS, submit is unchanged in this release: it builds the "
+                              "revision image and prints text (its receipt is JSON)" % flag)
         return main(args)
     args.on = args.on or machines.LOCAL
     return machines.submit(args, prepare)
@@ -306,6 +306,7 @@ def add_arguments(commands):
     parser.add_argument("--on", metavar="MACHINE",
                         help="where to run: local (this host, the default), a machine from machines.ini, or aws "
                              "(docs/machines.md; `cloudsweep machines` lists them)")
+    machines.add_file_argument(parser)
     parser.add_argument("--vcpus", type=int, help="vCPUs per command (default: [run] vcpus, else 1)")
     parser.add_argument("--memory-mib", type=int, help="memory per command in MiB (default: [run] memory_mib, "
                         "else %d)" % core.DEFAULT_MEMORY_MIB)

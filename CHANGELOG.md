@@ -29,6 +29,12 @@
   started from by hand would see. This needs Apptainer 1.0 or SingularityCE 3.7 or newer; an older one is refused, and
   `doctor --on` reports it. Tested on the ECE cluster (Apptainer 1.5.5); DeltaAI's 1.4.2 offers
   the option.
+- `--machines FILE` on `submit`, `status`, `cancel`, `fetch`, `doctor` and `machines` searches FILE
+  before the project's and the user's machines.ini. A submission's receipt now records the file and
+  the resolved section (`machines_file`, `section`), and `status`, `cancel` and `fetch` of it use
+  them, as do `status` and `cancel --all` without `--on` for this host's submissions; `--on MACHINE`
+  uses the current files instead. Submissions are grouped by where they run
+  (host, workdir, setup), no longer by section name.
 
 ## 0.2.2 (2026-11-09)
 

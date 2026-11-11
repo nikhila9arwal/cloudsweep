@@ -73,7 +73,7 @@ def doctor(args):
     except Refusal as error:
         row("git repository", False, str(error))
         return 1
-    target = None if on == machines.AWS else machines.load(repo, on)
+    target = None if on == machines.AWS else machines.load(repo, on, args.machines)
     try:
         config = project.load(repo)
         name = project.name(config)
@@ -87,7 +87,7 @@ def doctor(args):
     except Refusal as error:
         row(project.NAME, False, str(error))
     if on != machines.AWS:
-        machines.doctor(repo, on, row)
+        machines.doctor(repo, on, row, args.machines)
         return 0 if all(ok for _, ok, _ in rows) else 1
     try:
         values = settings.load(repo)
@@ -134,10 +134,12 @@ def main(argv=None):
     start.set_defaults(handler=init)
     listing = commands.add_parser("machines", help="list the machines you can run on, and what each is for")
     listing.add_argument("--json", action="store_true", help="machine-readable output")
+    machines.add_file_argument(listing)
     listing.set_defaults(handler=machines.show)
     check = commands.add_parser("doctor", help="check the project and a machine (default local), or the AWS "
                                 "deployment with --on aws")
     check.add_argument("--on", metavar="MACHINE", help="local, a machine from machines.ini, or aws")
+    machines.add_file_argument(check)
     check.set_defaults(handler=doctor)
     admin.add_arguments(commands)
     image.add_arguments(commands)

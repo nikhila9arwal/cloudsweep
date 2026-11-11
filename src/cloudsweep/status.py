@@ -158,15 +158,20 @@ def cancel(args):
 
 
 def by_machine(args, submissions):
-    """machine name -> submissions: --on, else the machines their receipts name; local for none."""
+    """[(machine settings or AWS, submissions)]: --on names one machine (or aws), with its settings
+    now; otherwise each submission's receipt gives its settings; for none, this checkout's
+    submissions on this host, each with its receipt's settings."""
+    repo = project.repository()
+    if args.on == machines.AWS:
+        return [(machines.AWS, list(submissions))]
+    if not args.on and not submissions:
+        submissions = machines.receipts(repo, machines.LOCAL)
     if args.on or not submissions:
-        return {args.on or machines.LOCAL: list(submissions)}
-    groups = {}
-    for submission in submissions:
-        groups.setdefault(machines.machine_of(project.repository(), submission), []).append(submission)
-    if machines.AWS in groups and len(groups) > 1:
-        raise Refusal("%s ran on AWS and the others on machines; ask about them separately"
-                      % ", ".join(groups[machines.AWS]))
+        return [(machines.load(repo, args.on or machines.LOCAL, args.machines), list(submissions))]
+    groups = machines.groups(repo, submissions, args.machines)
+    on_aws = [members for machine, members in groups if machine == machines.AWS]
+    if on_aws and len(groups) > 1:
+        raise Refusal("%s ran on AWS and the others on machines; ask about them separately" % ", ".join(on_aws[0]))
     return groups
 
 
@@ -176,12 +181,14 @@ def route_status(args):
             raise Refusal("--storage inventories the AWS bucket; it has no --on MACHINE form")
         return status(args)
     groups = by_machine(args, args.submissions)
-    return status(args) if machines.AWS in groups else machines.status(args, groups)
+    return status(args) if groups[0][0] == machines.AWS else machines.status(args, groups)
 
 
 def route_cancel(args):
-    name = next(iter(by_machine(args, [args.submission] if args.submission else [])))
-    return cancel(args) if name == machines.AWS else machines.cancel(args, name)
+    groups = by_machine(args, [args.submission] if args.submission else [])
+    if groups[0][0] == machines.AWS:
+        return cancel(args)
+    return machines.cancel(args, groups)
 
 
 def add_arguments(commands):
@@ -192,6 +199,7 @@ def add_arguments(commands):
                         "machine the submissions' receipts name, else local)")
     parser.add_argument("--json", action="store_true", help="machine-readable output")
     parser.add_argument("--storage", action="store_true", help="inventory retained storage instead of jobs")
+    machines.add_file_argument(parser)
     parser.set_defaults(handler=route_status)
 
     stop = commands.add_parser("cancel", help="stop a submission, or all work",
@@ -206,6 +214,7 @@ def add_arguments(commands):
     target.add_argument("--all", action="store_true", help="this checkout's submissions on the machine (with "
                         "--on aws: all work in the AWS queue)")
     stop.add_argument("--on", metavar="MACHINE", help="local, a machine from machines.ini, or aws")
+    machines.add_file_argument(stop)
     stop.add_argument("--wait", type=int, default=0, metavar="MINUTES",
                       help="poll until the work has stopped (with --on aws: until capacity is zero), at most this "
                            "long")

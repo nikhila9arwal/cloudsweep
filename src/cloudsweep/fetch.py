@@ -175,9 +175,11 @@ def main(args):
     if not core.SUBMISSION_RE.fullmatch(args.submission):
         return settings.fail("invalid submission id %r" % args.submission)
     from . import machines  # it builds on this module
-    name = args.on or machines.machine_of(project.repository(), args.submission)
-    if name != machines.AWS:
-        return machines.fetch_results(args, name)
+    repo = project.repository()
+    machine = (machines.AWS if args.on == machines.AWS else machines.load(repo, args.on, args.machines) if args.on
+               else machines.machine_for(repo, args.submission, args.machines))
+    if machine != machines.AWS:
+        return machines.fetch_results(args, machine)
     values = settings.load(project.repository())
     aws = settings.aws_for(values)
     if args.wait is not None:
@@ -197,6 +199,8 @@ def add_arguments(commands):
                         help="first wait until the submission finishes (default at most a day)")
     parser.add_argument("--on", metavar="MACHINE", help="where it ran: local, a machine from machines.ini (copied "
                         "with rsync), or aws (default: the machine the receipt names, else local)")
+    parser.add_argument("--machines", type=Path, metavar="FILE",
+                        help="a machines.ini searched first (a submission's receipt records the settings it used)")
     parser.set_defaults(handler=main)
 
 

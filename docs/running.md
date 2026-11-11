@@ -56,6 +56,7 @@ for the AWS estimate, ceiling and billing gaps.
 | `--hours H` | per-command time limit: 60 seconds to 14 days; defaults to `[run] hours` |
 | `--vcpus N`, `--memory-mib M` | per-command reservations; defaults from `[run]`, else 1 and 3500 |
 | `--on WHERE` | `local` (this host, the default), a machine from [machines.ini](machines.md), or `aws` |
+| `--machines FILE` | a machines.ini searched first; the receipt records the settings used ([machines](machines.md#describe-a-machine)) |
 | `--gpus N` | GPUs per command, not on AWS; defaults to `[run] gpus`, else 0 |
 | `--revision REV` | committed revision; default `HEAD` |
 | `--isolated` | on AWS, reserve the largest deployed instance's CPU and usable memory per command |

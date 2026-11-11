@@ -62,15 +62,18 @@ STAMP = "import os, sys; s = os.stat(os.path.expanduser(sys.argv[1])); print('%d
 SIGNAL_SECONDS = 120  # Slurm sends SIGTERM this long before the time limit, so the worker can upload
 
 
-def files(repo):
-    """machines.ini files, first match wins: the project's, then the user's."""
+def files(repo, extra=None):
+    """machines.ini files, first match wins: the one given with --machines, the project's, then
+    the user's."""
     user = Path(os.environ.get("XDG_CONFIG_HOME") or Path.home() / ".config") / "cloudsweep" / FILE
-    return [settings.state_dir(repo) / FILE, user]
+    return ([Path(extra).absolute()] if extra else []) + [settings.state_dir(repo) / FILE, user]
 
 
-def sections(repo):
-    """(name, section, where) for every machine described, the project's file first."""
-    for file in files(repo):
+def sections(repo, extra=None):
+    """(name, section, file) for every machine described, in the order files() searches them."""
+    if extra and not Path(extra).is_file():
+        raise Refusal("--machines %s: no such file" % extra)
+    for file in files(repo, extra):
         if not file.is_file():
             continue
         parser = configparser.ConfigParser(interpolation=None, inline_comment_prefixes=("#",))
@@ -79,34 +82,34 @@ def sections(repo):
         except configparser.Error as error:
             raise Refusal("%s: %s" % (file, error))
         for name in parser.sections():
-            yield name, parser[name], "[%s] in %s" % (name, file)
+            yield name, parser[name], file
 
 
-def load(repo, name):
+def load(repo, name, extra=None):
     """One machine's settings, checked."""
     if not NAME_RE.fullmatch(name or ""):
         raise Refusal("invalid machine name %r" % name)
     names = []
-    for found, section, where in sections(repo):
+    for found, section, file in sections(repo, extra):
         if found == name:
-            return machine(name, section, where)
+            return machine(name, section, "[%s] in %s" % (name, file), file)
         names.append(found)
     if name == LOCAL:
         return machine(name, {}, "the built-in local machine")
     raise Refusal("no machine [%s] in %s; `--on local` runs on this host and `--on aws` on AWS. Machines "
-                  "described: %s" % (name, " or ".join(str(file) for file in files(repo)),
+                  "described: %s" % (name, " or ".join(str(file) for file in files(repo, extra)),
                                      ", ".join(sorted(set(names))) or "none"))
 
 
 def show(args):
     """cloudsweep machines: every machine this project can run on, and what each is for."""
     repo, rows, seen = project.repository(), [], set()
-    for name, section, where in sections(repo):
+    for name, section, file in sections(repo, args.machines):
         if name in seen:
             continue
         seen.add(name)
         try:
-            rows.append(machine(name, section, where))
+            rows.append(machine(name, section, "[%s] in %s" % (name, file), file))
         except (Refusal, ValueError) as error:  # a malformed section is reported, the others still listed
             rows.append({"name": name, "kind": "?", "host": "?", "container": None, "use": str(error)})
     if LOCAL not in seen:
@@ -128,7 +131,7 @@ def show(args):
     return 0
 
 
-def machine(name, section, where):
+def machine(name, section, where, file=None):
     if name == AWS:
         raise Refusal("%s: aws names the project's AWS deployment (--on aws); give this machine another name"
                       % where)
@@ -156,7 +159,7 @@ def machine(name, section, where):
         raise Refusal("%s: container must be apptainer (an image built from [image]), the path of a .sif image on "
                       "the machine, or left out to run in the machine's own environment" % where)
     result = {"name": name, "kind": kind, "host": host, "workdir": workdir, "container": container,
-              "use": " ".join(section.get("use", "").split()),
+              "file": str(file) if file else None, "use": " ".join(section.get("use", "").split()),
               "setup": [line.strip() for line in section.get("setup", "").splitlines() if line.strip()]}
     if kind == "slurm":
         for key in ("sbatch", "cpu_sbatch", "gpu_sbatch"):
@@ -171,6 +174,12 @@ def machine(name, section, where):
         raise Refusal("%s: systemd must be yes or no" % where)
     result["systemd"] = value in ("yes", "true", "1", "on")
     return result
+
+
+def add_file_argument(parser):
+    parser.add_argument("--machines", type=Path, metavar="FILE",
+                        help="a machines.ini searched before the project's and yours (a submission's receipt "
+                             "records the settings it used, so later commands need no flag)")
 
 
 def number(section, key, where, least):
@@ -560,7 +569,7 @@ def submit(args, prepare):
     repo = project.repository(args.repo)
     path, receipt = None, None
     try:
-        machine = load(repo, args.on)
+        machine = load(repo, args.on, args.machines)
         if args.isolated:
             raise Refusal("--isolated reserves a whole AWS instance; on a machine, request [run] vcpus and "
                           "memory_mib (slurm) or set slots (ssh)")
@@ -595,7 +604,8 @@ def submit(args, prepare):
         plan = {"submission": submission, "machine": machine["name"], "kind": machine["kind"],
                 "host": machine["host"], "workdir": workdir, "commit": commit, "children": len(commands),
                 "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus, "hours": str(hours), "build": build,
-                "no_build": bool(args.no_build), "image_digest": digest}
+                "no_build": bool(args.no_build), "image_digest": digest, "machines_file": machine["file"],
+                "section": {key: value for key, value in machine.items() if key != "file"}}
         if machine["container"] and not image:
             plan["container"] = "apptainer; the image is built when you submit"
         if image and image.get("sif"):
@@ -744,9 +754,9 @@ def receipts(repo, name):
     return found
 
 
-def machine_of(repo, submission):
-    """The machine a submission went to, from its receipt (AWS receipts name none, and may be kept
-    where the deployment's RECEIPTS says); local without one."""
+def receipt_of(repo, submission):
+    """A submission's receipt, from this checkout or where the deployment's RECEIPTS keeps AWS's;
+    None without one."""
     places = [settings.state_dir(repo) / "receipts"]
     try:
         places.append(Path(settings.read_values(settings.settings_path(repo))["RECEIPTS"]))
@@ -758,8 +768,47 @@ def machine_of(repo, submission):
         except (OSError, ValueError):
             continue
         if isinstance(receipt, dict):
-            return receipt.get("machine") or AWS
-    return LOCAL
+            return receipt
+    return None
+
+
+def machine_of(repo, submission):
+    """The name of the machine a submission went to (AWS receipts name none); local without a receipt."""
+    receipt = receipt_of(repo, submission)
+    return LOCAL if receipt is None else receipt.get("machine") or AWS
+
+
+def machine_for(repo, submission, extra=None):
+    """The settings a submission was made with: the section its receipt recorded, so that later
+    commands need neither --machines nor an unchanged file; for an older receipt, the section of
+    that name now; AWS for an AWS receipt; local without a receipt."""
+    receipt = receipt_of(repo, submission)
+    if receipt is None:
+        return load(repo, LOCAL, extra)
+    if not receipt.get("machine"):
+        return AWS
+    if isinstance(receipt.get("section"), dict):
+        return dict(receipt["section"], name=receipt["machine"])
+    return load(repo, receipt["machine"], extra)
+
+
+def endpoint(machine):
+    """What one remote call reaches: submissions with equal endpoints can share it."""
+    return machine["kind"], machine["host"], machine["workdir"], tuple(machine["setup"])
+
+
+def groups(repo, submissions, extra=None):
+    """[(machine settings or AWS, submissions)], one group per endpoint, in the order given."""
+    found = []
+    for submission in submissions:
+        machine = machine_for(repo, submission, extra)
+        for known, members in found:
+            if known == machine == AWS or (known != AWS and machine != AWS and endpoint(known) == endpoint(machine)):
+                members.append(submission)
+                break
+        else:
+            found.append((machine, [submission]))
+    return found
 
 
 def nodes_text(nodes):
@@ -863,17 +912,16 @@ def call_status(machine, *submissions):
 
 
 def status(args, groups):
-    """Print each machine's submissions (groups: machine name -> submissions, empty for all of
-    this checkout's); one JSON object for all of them with --json."""
+    """Print each group's submissions (groups: [(machine settings, submissions)], no submissions
+    for all of this checkout's on that machine); one JSON object for all of them with --json."""
     repo, reports = project.repository(), {}
-    for name, wanted in groups.items():
-        machine = load(repo, name)
-        wanted = wanted or receipts(repo, name)
+    for machine, wanted in groups:
+        wanted = wanted or receipts(repo, machine["name"])
         report = call_status(machine, *wanted) if wanted else {}
         reports.update(report)
         if args.json:
             continue
-        print("%s (%s, %s)" % (name, machine["kind"], at(machine, machine["workdir"])))
+        print("%s (%s, %s)" % (machine["name"], machine["kind"], at(machine, machine["workdir"])))
         for submission in wanted:
             print(describe(submission, report.get(submission, {})))
         if not wanted:
@@ -883,24 +931,42 @@ def status(args, groups):
     return 0
 
 
-def cancel(args, name):
-    repo = project.repository()
-    machine = load(repo, name)
-    wanted = [args.submission] if args.submission else receipts(repo, name)
-    report = call(machine, "cancel", *wanted) if wanted else {}
-    for submission in wanted:
-        if args.submission or report.get(submission) != "not running":
-            print("  %s: %s" % (submission, report.get(submission)))
+def cancel(args, groups):
+    """Stop each group's submissions (groups: [(machine settings, submissions)], none for all of this
+    checkout's on that machine), every group's before any wait; then with --wait poll them until
+    they have stopped, for at most --wait minutes in all. A machine that refuses does not keep the
+    others from being stopped; its refusal is raised at the end."""
+    repo, sent, refusals, failed = project.repository(), [], [], False
+    for machine, wanted in groups:
+        wanted = list(wanted) or receipts(repo, machine["name"])
+        try:
+            report = call(machine, "cancel", *wanted) if wanted else {}
+        except Refusal as error:
+            refusals.append(str(error))
+            continue
+        for submission in wanted:
+            if args.submission or report.get(submission) != "not running":
+                print("  %s: %s" % (submission, report.get(submission)), flush=True)
+        failed = failed or any(str(value).startswith("error") for value in report.values())
+        sent.append((machine, wanted))
     deadline = time.monotonic() + 60 * args.wait
-    while args.wait and wanted:
-        rows = call_status(machine, *wanted)
-        busy = [s for s in wanted if rows.get(s, {}).get("state") in ACTIVE]
-        if not busy:
+    while args.wait and sent:
+        busy = []
+        for machine, wanted in sent:
+            found = call_status(machine, *wanted)
+            left = [s for s in wanted if found.get(s, {}).get("state") in ACTIVE]
+            if left:
+                busy.append((machine, left))
+        sent = busy
+        if not sent:
             break
         if time.monotonic() > deadline:
-            raise Refusal("still running after --wait: %s" % ", ".join(busy))
+            refusals.append("still running after --wait: %s" % ", ".join(s for _, left in sent for s in left))
+            break
         time.sleep(30)
-    return 1 if any(str(value).startswith("error") for value in report.values()) else 0
+    if refusals:
+        raise Refusal("; ".join(refusals))
+    return 1 if failed else 0
 
 
 class Fetched(core.LocalStore):
@@ -938,10 +1004,8 @@ def wait_for(machine, submission, minutes):
         time.sleep(60)
 
 
-def fetch_results(args, name):
+def fetch_results(args, machine):
     """Copy the submission from the machine's store with rsync, then verify it with fetch's checks."""
-    repo = project.repository()
-    machine = load(repo, name)
     submission = args.submission
     if args.wait is not None:
         wait_for(machine, submission, args.wait)
@@ -975,9 +1039,9 @@ def fetch_results(args, name):
     return 0 if summary["complete"] else 1
 
 
-def doctor(repo, name, row):
+def doctor(repo, name, row, extra=None):
     """cloudsweep doctor's machine checks: reach the machine and report what cloudsweep needs there."""
-    machine = load(repo, name)
+    machine = load(repo, name, extra)
     row("machine", True, "%s: %s via %s, workdir %s" % (name, machine["kind"], "this host" if machine["host"] == LOCAL
                                                         else "ssh " + machine["host"], machine["workdir"]))
     result = call(machine, "check", machine["kind"], "1" if machine["kind"] == "ssh" and machine["gpus"] else "0",

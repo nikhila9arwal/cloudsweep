@@ -33,6 +33,14 @@ $EDITOR ~/.config/cloudsweep/machines.ini
 cloudsweep doctor --on pembroke2
 ```
 
+`--machines FILE`, on `submit` and every other command that reads machine settings, puts one more
+file first, so a set of sections for one task needs neither an edit to your files nor a moved
+`XDG_CONFIG_HOME` (which also moves git's settings). A submission's receipt records the file and the
+settings it was made with (`machines_file`, `section`); `status`, `cancel`, `fetch`, `wait` and
+`race` of that submission use those, as do `status` and `cancel --all` without `--on` for this
+host's submissions, so they need no flag and are not affected when the file changes. An explicit `--on MACHINE` uses the files as they are now instead, for example after
+repairing a section's `setup` line.
+
 These sections describe the machines this project was tested on. The accounts, partitions, GPU
 types and paths are examples: use your own. A `setup` venv must already exist on the machine; leave
 `setup` out when the machine's own Python and tools are enough.

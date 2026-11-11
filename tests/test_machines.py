@@ -242,7 +242,7 @@ class MachineTests(MachineFixture):
         self.assertEqual(code, 0, out)
         self.assertIn("#SBATCH --gpus-per-node=h100:2", out)
         self.assertIn('"--partition=gpu"', out)
-        self.assertNotIn("--partition=cpu", out)
+        self.assertNotIn("--partition=cpu", out.split('"sbatch": [')[2].split("]")[0])  # the batch line
         # A dry run only reads the cluster (its partitions' billing weights): nothing is sent or started.
         self.assertNotIn("sbatch", self.log.read_text())
         self.assertFalse((self.root / "cluster").exists())
@@ -297,6 +297,76 @@ class MachineTests(MachineFixture):
             self.wait_for_pool(self.home / "shared-work", submission)  # relative to the machine's home
             self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
 
+    def test_a_machines_file_given_once_serves_the_submission_s_later_commands(self):
+        given = self.root / "elsewhere.ini"
+        given.write_text("[cluster]\nkind = ssh\nhost = fakehost\nworkdir = %s/given-work\nslots = 1\n" % self.root)
+        code, out = self.cli("submit", "--on", "cluster", "--machines", str(given), "--commands", str(self.sweep),
+                             "--input", "trace.bin")
+        self.assertEqual(code, 0, out)
+        submission = re.search(r"submitted (\S+):", out).group(1)
+        receipt = self.receipt(submission)
+        self.assertEqual(receipt["machines_file"], str(given))
+        self.assertEqual((receipt["section"]["kind"], receipt["section"]["workdir"]),
+                         ("ssh", "%s/given-work" % self.root))
+        self.wait_for_pool(self.root / "given-work", submission)
+        other, _ = self.submit("cluster")  # the project's [cluster], a Slurm machine of the same name
+        given.unlink()  # later commands need neither the flag nor the file
+        code, out = self.cli("status", submission, other)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(out.count("cluster ("), 2)  # one group per endpoint, not per name
+        self.assertIn("%s FINISHED" % submission, out)
+        self.assertIn("%s FINISHED" % other, out)
+        self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
+        self.assertIn("--machines %s: no such file" % given, self.cli("status", "--machines", str(given))[1])
+        self.assertIn("--machines is for machines", self.cli("submit", "--on", "aws", "--machines", str(given),
+                                                              "--commands", str(self.sweep))[1])
+
+    def test_this_host_s_submissions_are_listed_and_cancelled_with_their_receipts_settings(self):
+        given = self.root / "other-local.ini"
+        given.write_text("[local]\nworkdir = %s/other-local\nslots = 1\n" % self.root)
+        self.sweep.write_text('["sh", "-c", "sleep 60"]\n')
+        code, out = self.cli("submit", "--on", "local", "--machines", str(given), "--commands", str(self.sweep))
+        self.assertEqual(code, 0, out)
+        submission = re.search(r"submitted (\S+):", out).group(1)
+        started = self.root / "other-local/store/runs" / submission / "0" / "1" / "started.json"
+        for _ in range(80):
+            if started.is_file():
+                break
+            time.sleep(0.25)
+        self.assertIn("%s RUNNING" % submission, self.cli("status")[1])  # no flag: the receipt's workdir
+        code, out = self.cli("cancel", "--all")
+        self.assertEqual(code, 0, out)
+        self.assertIn("%s: stop requested" % submission, out)
+        self.assertTrue(self.wait_for_pool(self.root / "other-local", submission)["stopped"])
+        self.assertIn("%s CANCELLED" % submission, self.cli("status")[1])
+
+    def test_cancel_stops_every_group_before_waiting_for_any(self):
+        first, second, third = (dict(machines.load(self.repo, "box"), workdir=str(self.root / name), name=name)
+                                for name in ("one", "two", "three"))
+        asked, clock = [], [0.0]
+        repository = mock.patch.object(machines.project, "repository", return_value=self.repo)  # any cwd
+        repository.start()
+        self.addCleanup(repository.stop)
+
+        def call(machine, action, *submissions, timeout=None):
+            asked.append((machine["name"], action) + submissions)
+            if machine["name"] == "two":
+                raise project.Refusal("cancel on two failed: no answer")
+            return {s: "stop requested" for s in submissions}
+
+        def call_status(machine, *submissions):
+            clock[0] += 40  # each poll takes a while; "one" is never seen to stop
+            return {s: {"state": "RUNNING" if machine["name"] == "one" else "CANCELLED"} for s in submissions}
+        args = mock.Mock(submission=None, wait=1)
+        with mock.patch.object(machines, "call", call), mock.patch.object(machines, "call_status", call_status), \
+                mock.patch.object(machines.time, "monotonic", lambda: clock[0]), \
+                mock.patch.object(machines.time, "sleep"), redirect_stdout(io.StringIO()):
+            with self.assertRaises(project.Refusal) as refused:
+                machines.cancel(args, [(first, ["a"]), (second, ["b"]), (third, ["c"])])
+        self.assertEqual([entry[0] for entry in asked], ["one", "two", "three"])  # all sent before the wait
+        self.assertIn("cancel on two failed", str(refused.exception))
+        self.assertIn("after --wait: a", str(refused.exception))
+
     def test_gpu_commands_get_one_slot_per_gpu(self):
         submission, out = self.submit("gpubox", "--gpus", "1")
         self.assertIn("a pool of 2 slot(s) of 1 GPU(s)", out)
@@ -331,10 +401,12 @@ class MachineTests(MachineFixture):
         self.assertIn("submit on broken failed", out)
         self.assertEqual(list((self.root / "broken/builds").glob("*.lock")), [])  # the build lock is released
         (self.repo / ".cloudsweep/machines.ini").write_text(MACHINES.format(root=self.root).replace("setup = false", ""))
-        self.assertIn("NOT STARTED", self.cli("status", submission)[1])
-        self.assertIn("it will not start", self.cli("cancel", submission)[1])
-        self.assertIn("%s CANCELLED" % submission, self.cli("status", submission)[1])
-        code, out = self.cli("fetch", submission, str(self.root / "results"))
+        # The receipt keeps the settings the submission was made with; --on uses the repaired file.
+        self.assertIn("status on broken failed", self.cli("status", submission)[1])
+        self.assertIn("NOT STARTED", self.cli("status", "--on", "broken", submission)[1])
+        self.assertIn("it will not start", self.cli("cancel", "--on", "broken", submission)[1])
+        self.assertIn("%s CANCELLED" % submission, self.cli("status", "--on", "broken", submission)[1])
+        code, out = self.cli("fetch", "--on", "broken", submission, str(self.root / "results"))
         self.assertEqual(code, 1, out)
         self.assertIn("child 0: no attempt yet", out)
 
