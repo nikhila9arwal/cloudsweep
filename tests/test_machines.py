@@ -701,6 +701,24 @@ class SlurmTests(MachineFixture):
         self.assertIn("billing on cpu: 1 unit(s) per task (no TRESBillingWeights: Slurm bills the allocated CPUs)", err)
         self.assertNotIn("sbatch", self.log.read_text())
 
+    def test_a_partition_per_submission_wins_and_is_billed_and_recorded(self):
+        code, out, err = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--gpus", "1",
+                                          "--partition", "gpu-short", "--commands", str(self.sweep), "--input",
+                                          "trace.bin")
+        self.assertEqual(code, 0, err)
+        plan = json.loads(out)
+        self.assertEqual(plan["sbatch"][-3:-1], ["--partition=gpu", "--partition=gpu-short"])  # the last wins
+        self.assertEqual((plan["partition"], plan["billing"][0]["partition"], plan["billing"][0]["units"]),
+                         ("gpu-short", "gpu-short", 2000))
+        submission, _ = self.submit("cluster", "--partition", "gpu-short")
+        sent = [line for line in self.log.read_text().splitlines() if line.startswith("sbatch")][-1]
+        self.assertTrue(sent.endswith('"--partition=cpu", "--partition=gpu-short"]'), sent)  # a CPU job here
+        self.assertEqual(self.receipt(submission)["partition"], "gpu-short")
+        self.assertIn("[box] is ssh", self.cli("submit", "--on", "box", "--partition", "x", "--commands",
+                                              str(self.sweep), "--input", "trace.bin")[1])
+        self.assertIn("--partition is for machines", self.cli("submit", "--on", "aws", "--partition", "x",
+                                                               "--commands", str(self.sweep))[1])
+
     def test_submit_json_gives_the_dry_run_fields_and_the_receipt(self):
         code, out, _ = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--commands",
                                         str(self.sweep), "--input", "trace.bin")

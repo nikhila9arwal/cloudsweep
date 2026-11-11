@@ -49,6 +49,8 @@
   Slurm machines (whose builds run on a shared login node) and all on ssh machines. The build's CPU
   affinity is set, so `nproc`, and with it `make -j"$(nproc)"`, sees that many without a change to
   the project. A Slurm build that used every core of the login node is now slower.
+- `submit --partition NAME` on a Slurm machine sends one submission to that partition, after the
+  section's `sbatch` options, and records it in the receipt, so a short partition needs no section.
 
 ## 0.2.2 (2026-11-09)
 

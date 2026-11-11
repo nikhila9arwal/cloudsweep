@@ -43,6 +43,7 @@ COMMON = {"kind", "host", "workdir", "setup", "container", "use", "vars", "binds
 KEYS = {"slurm": COMMON | {"sbatch", "cpu_sbatch", "gpu_sbatch", "gpu_type"},
         "ssh": COMMON | {"slots", "gpus", "systemd"}}
 GPU_TYPE_RE = re.compile(r"[A-Za-z0-9_.-]+")
+PARTITION_RE = re.compile(r"[A-Za-z0-9_.-]+")
 SIF_RE = re.compile(r"(~/|/)[A-Za-z0-9._+@%=,/-]+")  # an image already on the machine; unquoted in scripts
 LOCAL = "local"  # as a host: this machine, without ssh; as a machine name: built in, and the default
 AWS = "aws"  # the machine name of the project's AWS Batch deployment, which this module does not run
@@ -657,6 +658,10 @@ def submit(args, prepare):
         if args.isolated:
             raise Refusal("--isolated reserves a whole AWS instance; on a machine, request [run] vcpus and "
                           "memory_mib (slurm) or set slots (ssh)")
+        if args.partition and (machine["kind"] != "slurm" or not PARTITION_RE.fullmatch(args.partition)):
+            raise Refusal("--partition names a Slurm partition, such as ghx4-interactive, on a slurm machine; "
+                          "[%s] is %s" % (machine["name"], machine["kind"]) if machine["kind"] != "slurm"
+                          else "--partition must be a partition name (letters, digits, ._-)")
         commit, recipe, files_in, commands, hours, vcpus, memory_mib, gpus, template = prepare(args, repo, machine)
         if machine["kind"] == "ssh" and gpus and machine["gpus"] == 0:
             raise Refusal("these commands need GPUs; [%s] sets gpus = 0" % machine["name"])
@@ -705,8 +710,9 @@ def submit(args, prepare):
             plan["container"] = "apptainer, image %s built %s" % (image["key"], "here" if image["tag"] else
                                                                   "on the machine (this host cannot build for it)")
         if machine["kind"] == "slurm":
-            job.update(sbatch=machine["sbatch"] + machine["gpu_sbatch" if gpus else "cpu_sbatch"],
-                       gpu_type=machine["gpu_type"])
+            job.update(sbatch=machine["sbatch"] + machine["gpu_sbatch" if gpus else "cpu_sbatch"] +
+                       (["--partition=" + args.partition] if args.partition else []), gpu_type=machine["gpu_type"])
+            plan["partition"] = args.partition
             script = job_script(job, machine["setup"], code_hash(files_code))
             plan["sbatch"] = ["sbatch"] + job["sbatch"] + ["jobs/%s/job.sh" % submission]
             plan["billing"] = slurm_billing(machine, job)

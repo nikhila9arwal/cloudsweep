@@ -135,6 +135,10 @@ that the connection is open; cloudsweep's ssh and rsync calls reuse it until it 
 
 ## CPU and GPU commands
 
+`submit --partition NAME` sends one submission to another partition of a Slurm machine, such as
+DeltaAI's `ghx4-interactive`, without a section of its own: it comes after the section's `sbatch`
+options, so it wins, and the receipt records it. The dry run's billing reads that partition.
+
 Commands need no GPU unless `[run] gpus` in `cloudsweep.ini`, or `--gpus N`, asks for N per command.
 On Slurm, a GPU job adds `gpu_sbatch` and `--gpus-per-node=[gpu_type:]N`, and a CPU job adds
 `cpu_sbatch`. In an ssh pool each GPU command gets its own N GPUs through `CUDA_VISIBLE_DEVICES`.

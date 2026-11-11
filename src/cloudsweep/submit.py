@@ -330,7 +330,8 @@ def route(parser, args):
     """Without --on, run on this host; --on aws takes the AWS path, any other name a machine."""
     check_command_args(parser, args)
     if args.on == machines.AWS:
-        for flag, given in (("--json", args.json), ("--no-build", args.no_build), ("--machines", args.machines)):
+        for flag, given in (("--json", args.json), ("--no-build", args.no_build), ("--machines", args.machines),
+                            ("--partition", args.partition)):
             if given:
                 raise Refusal("%s is for machines; on AWS, submit is unchanged in this release: it builds the "
                               "revision image and prints text (its receipt is JSON)" % flag)
@@ -351,6 +352,9 @@ def add_arguments(commands):
     parser.add_argument("--memory-mib", type=int, help="memory per command in MiB (default: [run] memory_mib, "
                         "else %d)" % core.DEFAULT_MEMORY_MIB)
     parser.add_argument("--gpus", type=int, help="GPUs per command, not on AWS (default: [run] gpus, else 0)")
+    parser.add_argument("--partition", metavar="NAME",
+                        help="on a Slurm machine: the partition for this submission, after the section's sbatch "
+                             "options (so it wins); recorded in the receipt")
     parser.add_argument("--isolated", action="store_true",
                         help="on AWS: reserve a whole instance of the largest type per command (timing experiments)")
     parser.add_argument("--label", default="", help="free text recorded in the manifest and receipt")

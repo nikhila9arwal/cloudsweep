@@ -60,6 +60,7 @@ for the AWS estimate, ceiling and billing gaps.
 | `--on WHERE` | `local` (this host, the default), a machine from [machines.ini](machines.md), or `aws` |
 | `--machines FILE` | a machines.ini searched first; the receipt records the settings used ([machines](machines.md#describe-a-machine)) |
 | `--gpus N` | GPUs per command, not on AWS; defaults to `[run] gpus`, else 0 |
+| `--partition NAME` | on a Slurm machine, the partition for this submission, after the section's `sbatch` options |
 | `--revision REV` | committed revision; default `HEAD` |
 | `--isolated` | on AWS, reserve the largest deployed instance's CPU and usable memory per command |
 | `--label TEXT` | label saved with the submission |
