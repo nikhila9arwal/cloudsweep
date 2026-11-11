@@ -39,6 +39,8 @@
   name, both replaced at submission, so one job can run on machines whose paths differ. A value is
   text (its braces are not placeholders); an undefined variable refuses the submission. The receipt
   records the variables used, the template's sha256 and the resolved commands.
+- A command's container sees only its own submission in `/store`: the inputs and its submission's
+  records read only, and its submission's results; before, it saw every submission on the machine.
 
 ## 0.2.2 (2026-11-09)
 

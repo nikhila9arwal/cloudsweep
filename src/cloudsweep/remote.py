@@ -189,12 +189,18 @@ def in_container(site, work, env, store=False):
     /work and the home directory (apptainer sets HOME itself), the store at /store, and the host's
     GPUs (--nv) for GPU commands. The directory it starts from is not mounted (--no-mount cwd) and
     it starts in /work, so what it sees does not depend on where it was started: /work, /store,
-    /opt/cloudsweep (with the machine's own image), /tmp and /var/tmp, and the site's binds."""
+    /opt/cloudsweep (with the machine's own image), /tmp and /var/tmp, and the site's binds. Its
+    /store holds only what its worker uses, at the paths the worker uses: the inputs and its own
+    submission's records, read only, and its own submission's results; other submissions' records
+    and results on the machine are not visible."""
     argv = [apptainer(), "exec", "--cleanenv", "--home", "%s:/work" % work, "--no-mount", "cwd", "--pwd", "/work"]
     if site.job["container"].get("sif"):  # the machine's own image lacks the worker cloudsweep layers in
         argv += ["--bind", "%s:/opt/cloudsweep" % HERE]
     if store:
-        argv += ["--bind", "%s:/store" % site.store]
+        own = [("inputs", ":ro"), ("submissions/" + site.submission, ":ro"), ("runs/" + site.submission, "")]
+        for part, mode in own:
+            (site.store / part).mkdir(parents=True, exist_ok=True)  # a bind needs its source to exist
+            argv += ["--bind", "%s:/store/%s%s" % (site.store / part, part, mode)]
     if site.job["gpus"]:
         argv.append("--nv")
     for name, value in sorted(env.items()):

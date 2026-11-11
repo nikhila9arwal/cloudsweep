@@ -786,7 +786,7 @@ class BillingTests(unittest.TestCase):
 
 
 FAKE_APPTAINER = """#!{python}
-import os, shutil, sys
+import os, re, shutil, sys
 args = sys.argv[1:]
 if args[0] == "build":  # a SIF is a copy of the archive here
     shutil.copyfile(args[-1].split("://", 1)[1], args[-2])
@@ -800,7 +800,7 @@ while args[index].startswith("--"):
     index += 1
     if flag in ("--bind", "--home", "--env"):
         key, value = args[index].split("=" if flag == "--env" else ":", 1)
-        (env.__setitem__(key, value) if flag == "--env" else binds.__setitem__(value, key))
+        (env.__setitem__(key, value) if flag == "--env" else binds.__setitem__(value.split(":")[0], key))
         index += 1
     elif flag in ("--no-mount", "--pwd"):
         fixed[flag] = args[index]
@@ -808,15 +808,17 @@ while args[index].startswith("--"):
     clean = clean or flag == "--cleanenv"
 if "--home" in " ".join(args) and fixed != {{"--no-mount": "cwd", "--pwd": "/work"}}:
     sys.exit("the container would also see the directory it was started from")
-with open(os.environ["FAKE_LOG"], "a") as log:
-    log.write("apptainer exec %s\\n" % " ".join(sorted(binds)))
+if "/store" in binds:
+    sys.exit("the whole store is bound; a command sees only its own submission's")
+with open(os.environ["FAKE_LOG"], "a") as log:  # submission ids as SUB
+    log.write("apptainer exec %s\\n" % re.sub(r"20[0-9]{{6}}T[0-9]{{6}}Z-[0-9a-f]{{6}}", "SUB", " ".join(sorted(binds))))
 command = args[index + 1:]
 base = {{key: os.environ[key] for key in ("PATH", "FAKE_LOG", "FAKE_WORKER")}} if clean else dict(os.environ)
 base.update(env)
 if "/work" in binds:  # the container's paths, as host paths
     base["CLOUDSWEEP_WORK"] = binds["/work"]
-if base.get("CLOUDSWEEP_STORE") == "file:///store":
-    base["CLOUDSWEEP_STORE"] = "file://" + binds["/store"]
+if base.get("CLOUDSWEEP_STORE") == "file:///store":  # the store the narrowed binds come from
+    base["CLOUDSWEEP_STORE"] = "file://" + binds["/store/inputs"][:-len("/inputs")]
 if command[:2] == ["python3", "/opt/cloudsweep/worker.py"]:
     command = [sys.executable, os.environ["FAKE_WORKER"]] + command[2:]
 os.execvpe(command[0], command, base)
@@ -866,7 +868,7 @@ class ContainerTests(MachineFixture):
         job = json.loads((self.root / "ctr/jobs" / submission / "job.json").read_text())
         log = self.log.read_text()
         self.assertIn("apptainer exec /work\n", log)          # the revision's build, in the image
-        self.assertIn("apptainer exec /store /work\n", log)   # each command, in the image
+        self.assertIn("apptainer exec /store/inputs /store/runs/SUB /store/submissions/SUB /work\n", log)  # commands
         return job, self.root / "ctr/images" / job["container"]["key"], log
 
     def test_the_image_is_built_and_converted_here(self):
@@ -897,7 +899,8 @@ class ContainerTests(MachineFixture):
         submission, out = self.submit("given")
         self.wait_for_pool(self.root / "given", submission)
         self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
-        self.assertIn("apptainer exec /opt/cloudsweep /store /work\n", self.log.read_text())  # cloudsweep's worker, bound in
+        self.assertIn("apptainer exec /opt/cloudsweep /store/inputs /store/runs/SUB /store/submissions/SUB /work\n",
+                      self.log.read_text())  # cloudsweep's worker, bound in
         self.assertRegex(self.cli("doctor", "--on", "given")[1], r"image +ok +%s" % re.escape(str(self.root / "given.sif")))
         (self.root / "given.sif").unlink()
         self.assertRegex(self.cli("doctor", "--on", "given")[1], r"image +-- +given has no image")
@@ -924,11 +927,16 @@ class ContainerTests(MachineFixture):
         submission, _ = self.submit("given")  # the fake apptainer refuses a start without both flags
         self.wait_for_pool(self.root / "given", submission)
         self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
-        site = mock.Mock(job={"container": {"sif": "~/x.sif"}, "gpus": 0}, store=Path("/w/store"))
+        store, own = self.root / "w/store", "20261111T000000Z-abcdef"
+        site = mock.Mock(job={"container": {"sif": "~/x.sif"}, "gpus": 0}, store=store, submission=own)
         with mock.patch.object(remote, "apptainer", return_value="apptainer"):
             argv = remote.in_container(site, "/w/jobs/scratch", {}, store=True)
         self.assertEqual(argv[:9], ["apptainer", "exec", "--cleanenv", "--home", "/w/jobs/scratch:/work",
                                     "--no-mount", "cwd", "--pwd", "/work"])
+        binds = [argv[i + 1] for i, arg in enumerate(argv) if arg == "--bind"][1:]  # after /opt/cloudsweep
+        self.assertEqual(binds, ["%s/inputs:/store/inputs:ro" % store,
+                                 "%s/submissions/%s:/store/submissions/%s:ro" % (store, own, own),
+                                 "%s/runs/%s:/store/runs/%s" % (store, own, own)])
 
     def test_a_runtime_that_cannot_leave_the_start_directory_unmounted_is_refused(self):
         self.given_image()

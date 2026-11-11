@@ -223,7 +223,8 @@ Apptainer mounts it, which is `workdir` in a job and often the home directory in
 A build or a command sees only:
 
 - `/work`, its scratch directory and home, with the checkout at `/work/src`;
-- `/store`, the machine's store (commands only);
+- `/store`, for a command only, holding what its worker uses: the inputs and its own submission's
+  records, read only, and its own submission's results (other submissions' are not visible);
 - `/opt/cloudsweep`, cloudsweep's worker, with an image already on the machine;
 - `/tmp` and `/var/tmp`;
 - the paths the site's `apptainer.conf` binds, such as `/etc/localtime` and `/etc/hosts`.
