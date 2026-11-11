@@ -668,7 +668,10 @@ args = sys.argv[1:]
 if args[0] == "build":  # a SIF is a copy of the archive here
     shutil.copyfile(args[-1].split("://", 1)[1], args[-2])
     sys.exit(0)
-index, binds, env, clean = 1, {{}}, {{}}, False
+if args[1:] == ["--help"]:
+    print(os.environ.get("FAKE_APPTAINER_HELP", "      --no-mount strings   disable one or more 'mount xxx' options"))
+    sys.exit(0)
+index, binds, env, clean, fixed = 1, {{}}, {{}}, False, {{}}
 while args[index].startswith("--"):
     flag = args[index]
     index += 1
@@ -676,7 +679,12 @@ while args[index].startswith("--"):
         key, value = args[index].split("=" if flag == "--env" else ":", 1)
         (env.__setitem__(key, value) if flag == "--env" else binds.__setitem__(value, key))
         index += 1
+    elif flag in ("--no-mount", "--pwd"):
+        fixed[flag] = args[index]
+        index += 1
     clean = clean or flag == "--cleanenv"
+if "--home" in " ".join(args) and fixed != {{"--no-mount": "cwd", "--pwd": "/work"}}:
+    sys.exit("the container would also see the directory it was started from")
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write("apptainer exec %s\\n" % " ".join(sorted(binds)))
 command = args[index + 1:]
@@ -787,6 +795,24 @@ class ContainerTests(MachineFixture):
                              "trace.bin")
         self.assertEqual(code, 1, out)
         self.assertIn("given has no image", out)
+
+    def test_every_container_starts_in_work_without_the_directory_it_started_from(self):
+        self.given_image()
+        submission, _ = self.submit("given")  # the fake apptainer refuses a start without both flags
+        self.wait_for_pool(self.root / "given", submission)
+        self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
+        site = mock.Mock(job={"container": {"sif": "~/x.sif"}, "gpus": 0}, store=Path("/w/store"))
+        with mock.patch.object(remote, "apptainer", return_value="apptainer"):
+            argv = remote.in_container(site, "/w/jobs/scratch", {}, store=True)
+        self.assertEqual(argv[:9], ["apptainer", "exec", "--cleanenv", "--home", "/w/jobs/scratch:/work",
+                                    "--no-mount", "cwd", "--pwd", "/work"])
+
+    def test_a_runtime_that_cannot_leave_the_start_directory_unmounted_is_refused(self):
+        self.given_image()
+        os.environ["FAKE_APPTAINER_HELP"] = "Usage: apptainer exec [exec options...] <container> <command>"
+        _, out = self.submit("given", expect=1)
+        self.assertIn("has no --no-mount option", out)
+        self.assertRegex(self.cli("doctor", "--on", "given")[1], r"apptainer +-- +\S+ lacks --no-mount")
 
     def test_an_image_replaced_after_its_submission_is_refused(self):
         self.given_image()

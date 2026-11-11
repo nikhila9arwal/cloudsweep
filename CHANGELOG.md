@@ -20,6 +20,13 @@
   built when you submit.
 - `submit --json` on a machine prints one JSON object: the receipt, which has every field of the
   dry run, with its path. `submit --dry-run --json` prints the plan with the batch script in it.
+- **Changed:** a container on a machine starts with `--no-mount cwd --pwd /work`, so a build or
+  command sees the same paths wherever it was started: `/work`, `/store`, `/opt/cloudsweep` (with
+  an image already on the machine), `/tmp`, `/var/tmp` and the site's binds. It no longer sees
+  `workdir`, which Apptainer mounted because a job starts there, nor the home directory a command
+  started from by hand would see. This needs Apptainer 1.0 or SingularityCE 3.7 or newer; an older one is refused, and
+  `doctor --on` reports it. Tested on the ECE cluster (Apptainer 1.5.5); DeltaAI's 1.4.2 offers
+  the option.
 
 ## 0.2.2 (2026-11-09)
 

@@ -136,9 +136,26 @@ def my_turn(site, lock, made, what):
     return True
 
 
+FIXED = []  # the container runtime, once checked
+
+
+def mounts_fixed(runtime):
+    """Whether the runtime can leave the current directory unmounted (--no-mount, from Apptainer
+    1.0 and SingularityCE 3.7)."""
+    try:
+        return "--no-mount" in run([runtime, "exec", "--help"]).stdout
+    except OSError:
+        return False
+
+
 def apptainer():
+    if FIXED:
+        return FIXED[0]
     found = shutil.which("apptainer") or shutil.which("singularity")
     core.require(found, "container = apptainer, but this machine has neither apptainer nor singularity")
+    core.require(mounts_fixed(found), "%s has no --no-mount option, which keeps what a container sees independent "
+                 "of where it starts; cloudsweep needs Apptainer 1.0 or SingularityCE 3.7 or newer" % found)
+    FIXED.append(found)
     return found
 
 
@@ -170,8 +187,10 @@ def image_path(site):
 def in_container(site, work, env, store=False):
     """The image's worker under apptainer exec, as Batch runs it: only these variables, work as
     /work and the home directory (apptainer sets HOME itself), the store at /store, and the host's
-    GPUs (--nv) for GPU commands."""
-    argv = [apptainer(), "exec", "--cleanenv", "--home", "%s:/work" % work]
+    GPUs (--nv) for GPU commands. The directory it starts from is not mounted (--no-mount cwd) and
+    it starts in /work, so what it sees does not depend on where it was started: /work, /store,
+    /opt/cloudsweep (with the machine's own image), /tmp and /var/tmp, and the site's binds."""
+    argv = [apptainer(), "exec", "--cleanenv", "--home", "%s:/work" % work, "--no-mount", "cwd", "--pwd", "/work"]
     if site.job["container"].get("sif"):  # the machine's own image lacks the worker cloudsweep layers in
         argv += ["--bind", "%s:/opt/cloudsweep" % HERE]
     if store:
@@ -461,7 +480,7 @@ def child(site, index=None):
         for signum in (signal.SIGTERM, signal.SIGINT):
             signal.signal(signum, forward)
         started.append(subprocess.Popen(in_container(site, scratch, env, store=True) + ["run", site.submission],
-                                        stdin=subprocess.DEVNULL))
+                                        stdin=subprocess.DEVNULL, cwd=str(scratch)))
         if stops:  # it came while the container started
             started[0].send_signal(signal.SIGTERM)
         return started[0].wait()
@@ -775,7 +794,9 @@ def check(root, kind, gpus_wanted, container):
     rows = [["python3", True, platform.python_version()]]
     if container:
         found = shutil.which("apptainer") or shutil.which("singularity")
-        rows.append(["apptainer", bool(found), found or "missing (container = apptainer)"])
+        fixed = bool(found) and mounts_fixed(found)
+        rows.append(["apptainer", fixed, "missing (container = apptainer)" if not found else found if fixed else
+                     "%s lacks --no-mount: Apptainer 1.0 or SingularityCE 3.7 or newer needed" % found])
     for tool in ("git", "rsync") + (("sbatch", "squeue", "scancel") if kind == "slurm" else ()):
         rows.append([tool, bool(shutil.which(tool)), shutil.which(tool) or "missing"])
     rows.append(["cpus", True, "%d usable here, %s" % (len(os.sched_getaffinity(0)), platform.machine())])

@@ -177,9 +177,24 @@ starts new builds, and a queued command refuses to run in a file replaced after 
 On the machine, the revision is built inside the image (on a cluster's login node) with the
 checkout at `/work/src`, as on AWS, and each command runs with `apptainer exec`: its copy of the
 checkout at `/work/src` (`/work` is its home directory), the store at `/store`, and the machine's GPUs
-(`--nv`) for GPU commands. The machine needs Apptainer (or Singularity), on a cluster's compute nodes
-too. If your home directory here is on a network filesystem, set `CLOUDSWEEP_PODMAN_ROOT` to a local
-directory for this host's podman; a machine that builds the image uses its own temporary directory.
+(`--nv`) for GPU commands. The machine needs Apptainer 1.0 or newer (or SingularityCE 3.7 or newer),
+on a cluster's compute nodes too. If your home directory here is on a network filesystem, set
+`CLOUDSWEEP_PODMAN_ROOT` to a local directory for this host's podman; a machine that builds the image
+uses its own temporary directory.
+
+What a container sees does not depend on where it was started. cloudsweep starts it with
+`--no-mount cwd --pwd /work`, so the directory it starts from is not mounted; without that,
+Apptainer mounts it, which is `workdir` in a job and often the home directory in a test by hand.
+A build or a command sees only:
+
+- `/work`, its scratch directory and home, with the checkout at `/work/src`;
+- `/store`, the machine's store (commands only);
+- `/opt/cloudsweep`, cloudsweep's worker, with an image already on the machine;
+- `/tmp` and `/var/tmp`;
+- the paths the site's `apptainer.conf` binds, such as `/etc/localtime` and `/etc/hosts`.
+
+Your home directory, `workdir` and the site's other file systems are not visible. A program or data
+there must be bound in by a `setup` line, for example `export APPTAINER_BIND=/projects/me/models`.
 
 ## What happens
 
