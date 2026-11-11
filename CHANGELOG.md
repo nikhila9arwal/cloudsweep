@@ -41,6 +41,10 @@
   records the variables used, the template's sha256 and the resolved commands.
 - A command's container sees only its own submission in `/store`: the inputs and its submission's
   records read only, and its submission's results; before, it saw every submission on the machine.
+- `binds = SRC[:DEST[:ro|rw]], ...` in a section with a container makes host paths visible to its
+  commands (not to the build). `submit`, also in a dry run, tests each source on the machine in the
+  call it makes for the image, and refuses a missing one; `doctor --on` reports them; the receipt
+  records them. A destination covering cloudsweep's `/work`, `/store` or `/opt/cloudsweep` is refused.
 
 ## 0.2.2 (2026-11-09)
 

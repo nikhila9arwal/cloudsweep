@@ -945,6 +945,38 @@ class ContainerTests(MachineFixture):
         self.assertIn("has no --no-mount option", out)
         self.assertRegex(self.cli("doctor", "--on", "given")[1], r"apptainer +-- +\S+ lacks --no-mount")
 
+    def test_binds_are_checked_on_the_machine_recorded_and_given_to_commands_only(self):
+        (self.home / "models").mkdir()
+        (self.root / "venv").mkdir()
+        self.given_image()
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("binds = ~/models:/models:ro, %s\n" % (self.root / "venv"))
+        submission, _ = self.submit("given")
+        expected = ["%s:/models:ro" % (self.home / "models"), "%s:%s:rw" % (self.root / "venv", self.root / "venv")]
+        self.assertEqual(self.receipt(submission)["binds"], expected)
+        self.wait_for_pool(self.root / "given", submission)
+        self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
+        log = self.log.read_text()
+        self.assertIn("apptainer exec /models /opt/cloudsweep /store/inputs /store/runs/SUB /store/submissions/SUB "
+                      "%s /work\n" % (self.root / "venv"), log)  # each command
+        self.assertIn("apptainer exec /opt/cloudsweep /work\n", log)  # the build gets no binds
+        self.assertRegex(self.cli("doctor", "--on", "given")[1], r"binds +ok +%s" % re.escape(str(self.home)))
+        (self.home / "models").rmdir()
+        code, out = self.cli("submit", "--on", "given", "--dry-run", "--commands", str(self.sweep), "--input", "trace.bin")
+        self.assertEqual(code, 1, out)
+        self.assertIn("binds: ~/models does not exist on given", out)
+        file = self.repo / ".cloudsweep/machines.ini"
+        for text, message in (("binds = /data:/work/src\n", "would cover /work"),
+                              ("binds = /opt\n", "would cover"),
+                              ("binds = /data:relative\n", "binds must be"),
+                              ("binds = /data:/data:rx\n", "binds must be")):
+            file.write_text("[m]\nkind = ssh\ncontainer = ~/x.sif\n" + text)
+            with self.assertRaisesRegex(project.Refusal, message):
+                machines.load(self.repo, "m")
+        file.write_text("[m]\nkind = ssh\nbinds = /data\n")
+        with self.assertRaisesRegex(project.Refusal, "binds need a container"):
+            machines.load(self.repo, "m")
+
     def test_an_image_replaced_after_its_submission_is_refused(self):
         self.given_image()
         found = machines.existing_image

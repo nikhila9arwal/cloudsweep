@@ -196,7 +196,9 @@ def in_container(site, work, env, store=False):
     argv = [apptainer(), "exec", "--cleanenv", "--home", "%s:/work" % work, "--no-mount", "cwd", "--pwd", "/work"]
     if site.job["container"].get("sif"):  # the machine's own image lacks the worker cloudsweep layers in
         argv += ["--bind", "%s:/opt/cloudsweep" % HERE]
-    if store:
+    if store:  # a command, not the build: the section's binds (checked at submission), and its store
+        for bind in site.job.get("binds") or []:
+            argv += ["--bind", bind]
         own = [("inputs", ":ro"), ("submissions/" + site.submission, ":ro"), ("runs/" + site.submission, "")]
         for part, mode in own:
             (site.store / part).mkdir(parents=True, exist_ok=True)  # a bind needs its source to exist

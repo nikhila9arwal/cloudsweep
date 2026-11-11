@@ -24,6 +24,7 @@ import hashlib
 import json
 import os
 import platform
+import posixpath
 import re
 import shlex
 import shutil
@@ -38,7 +39,7 @@ from . import core, engine, fetch, project, settings
 from .project import Refusal
 
 FILE = "machines.ini"
-COMMON = {"kind", "host", "workdir", "setup", "container", "use", "vars"}
+COMMON = {"kind", "host", "workdir", "setup", "container", "use", "vars", "binds"}
 KEYS = {"slurm": COMMON | {"sbatch", "cpu_sbatch", "gpu_sbatch", "gpu_type"},
         "ssh": COMMON | {"slots", "gpus", "systemd"}}
 GPU_TYPE_RE = re.compile(r"[A-Za-z0-9_.-]+")
@@ -47,6 +48,8 @@ LOCAL = "local"  # as a host: this machine, without ssh; as a machine name: buil
 AWS = "aws"  # the machine name of the project's AWS Batch deployment, which this module does not run
 NAME_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 VAR_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+BIND_RE = re.compile(r"(~/|/)[A-Za-z0-9._+@%=/-]*")  # unquoted in scripts, so ~/ expands on the machine
+CLOUDSWEEP_PATHS = ("/work", "/store", "/opt/cloudsweep")  # where cloudsweep mounts its own
 HOST_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._@-]*")
 WORKDIR_RE = re.compile(r"(?!.*(^|/)\.\.(/|$))[A-Za-z0-9._+@%=,/][A-Za-z0-9._+@%=,/-]*")  # unquoted in scripts
 DEFAULT_WORKDIR = "cloudsweep"  # relative paths are relative to the machine's home directory
@@ -162,7 +165,9 @@ def machine(name, section, where, file=None):
     result = {"name": name, "kind": kind, "host": host, "workdir": workdir, "container": container,
               "file": str(file) if file else None, "use": " ".join(section.get("use", "").split()),
               "setup": [line.strip() for line in section.get("setup", "").splitlines() if line.strip()],
-              "vars": variables(section.get("vars", ""), where)}
+              "vars": variables(section.get("vars", ""), where), "binds": bind_list(section.get("binds", ""), where)}
+    if result["binds"] and not container:
+        raise Refusal("%s: binds need a container; without one, commands see the machine's own files" % where)
     if kind == "slurm":
         for key in ("sbatch", "cpu_sbatch", "gpu_sbatch"):
             result[key] = shlex.split(section.get(key, ""))
@@ -196,6 +201,63 @@ def variables(text, where):
                           "or _, then letters, digits or _); a VALUE has no comma: %r" % (where, item.strip()))
         found[name] = value
     return found
+
+
+def covers_cloudsweep(target):
+    """Whether a bind at target would hide or replace a path cloudsweep mounts (or a parent of one)."""
+    target = posixpath.normpath(target)
+    return any(target == path or target.startswith(path + "/") or path.startswith(target.rstrip("/") + "/")
+               for path in CLOUDSWEEP_PATHS)
+
+
+def bind_list(text, where):
+    """binds = SRC[:DEST[:ro|rw]], ...: host paths a container sees. DEST defaults to SRC, as
+    expanded on the machine."""
+    found = []
+    for item in (part.strip() for part in text.replace("\n", ",").split(",")):
+        if not item:
+            continue
+        parts = item.split(":")
+        source, target = parts[0], parts[1] if len(parts) > 1 and parts[1] else None
+        mode = parts[2] if len(parts) > 2 else "rw"
+        if len(parts) > 3 or not BIND_RE.fullmatch(source) or mode not in ("ro", "rw") or \
+                (target is not None and not (target.startswith("/") and BIND_RE.fullmatch(target))):
+            raise Refusal("%s: binds must be SRC[:DEST[:ro|rw]], comma-separated, SRC absolute or starting with "
+                          "~/, DEST absolute, without spaces: %r" % (where, item))
+        place = target or source  # a source under ~/ is checked once the machine has expanded it
+        if place.startswith("/") and covers_cloudsweep(place):
+            raise Refusal("%s: a bind at %s would cover %s, where cloudsweep mounts the job's own files"
+                          % (where, target or source, ", ".join(CLOUDSWEEP_PATHS)))
+        found.append({"source": source, "target": target, "mode": mode})
+    return found
+
+
+def bind_lines(machine):
+    """Shell lines that test each bind's source on the machine and print it expanded."""
+    return ["if [ -e %s ]; then echo CLOUDSWEEP-BIND %d ok %s; else echo CLOUDSWEEP-BIND %d missing; fi"
+            % (bind["source"], index, bind["source"], index) for index, bind in enumerate(machine["binds"])]
+
+
+def resolved_binds(machine, output):
+    """The binds as Apptainer takes them (SRC:DEST:MODE, expanded), from bind_lines' output;
+    a missing source, or one that expands to a path covering cloudsweep's, is refused."""
+    found = {}
+    for line in output.splitlines():
+        words = line.split()
+        if len(words) >= 3 and words[0] == "CLOUDSWEEP-BIND" and words[1].isdigit():
+            found[int(words[1])] = words[3] if words[2] == "ok" and len(words) > 3 else None
+    binds = []
+    for index, bind in enumerate(machine["binds"]):
+        source = found.get(index)
+        if source is None:
+            raise Refusal("binds: %s does not exist on %s (%s)" % (bind["source"], machine["name"],
+                                                                  machine.get("file") or "its section"))
+        target = bind["target"] or source
+        if covers_cloudsweep(target):
+            raise Refusal("binds: %s is %s on %s, which covers %s" % (bind["source"], target, machine["name"],
+                                                                      ", ".join(CLOUDSWEEP_PATHS)))
+        binds.append("%s:%s:%s" % (source, target, bind["mode"]))
+    return binds
 
 
 def number(section, key, where, least):
@@ -284,14 +346,15 @@ def context_files(context):
 
 def existing_image(machine):
     """An image already on the machine (container = PATH.sif), named by its path, size and time, so
-    a replaced file makes a new environment (and new builds) rather than reusing old ones."""
-    done = ssh(machine, "\n".join(["set -e"] + machine["setup"] + ["python3 -c %s %s" % (
+    a replaced file makes a new environment (and new builds) rather than reusing old ones. The same
+    call tests the section's binds; their result is under "output" for resolved_binds."""
+    done = ssh(machine, "\n".join(["set -e"] + machine["setup"] + bind_lines(machine) + ["python3 -c %s %s" % (
         shlex.quote(STAMP), machine["container"])]))
     stamp = (done.stdout.split() or [""])[-1]
     if done.returncode or ":" not in stamp:
         raise Refusal("%s has no image %s" % (machine["name"], machine["container"]))
     key = core.sha256_bytes(("%s\0%s" % (machine["container"], stamp)).encode())[:16]
-    return {"key": key, "sif": machine["container"], "stamp": stamp}
+    return {"key": key, "sif": machine["container"], "stamp": stamp, "output": done.stdout}
 
 
 def stage_image(tree, image):
@@ -592,15 +655,19 @@ def submit(args, prepare):
         commit, recipe, files_in, commands, hours, vcpus, memory_mib, gpus, template = prepare(args, repo, machine)
         if machine["kind"] == "ssh" and gpus and machine["gpus"] == 0:
             raise Refusal("these commands need GPUs; [%s] sets gpus = 0" % machine["name"])
-        image = None
+        image, binds = None, []
         if machine["container"] and machine["container"] != "apptainer":
             image = existing_image(machine)  # read only, so a dry run resolves it too: the build depends on it
-        elif machine["container"] and not args.dry_run:
-            arch = ssh(machine, "uname -m").stdout.split()
+            binds = resolved_binds(machine, image.pop("output"))
+        elif machine["container"]:  # the architecture, and the binds, read in one call (also in a dry run)
+            done = ssh(machine, "\n".join(bind_lines(machine) + ["uname -m"]))
+            arch = done.stdout.split()
             target = PLATFORM_OF.get(arch[-1] if arch else "")
             if not target:
                 raise Refusal("cannot tell %s's architecture (uname -m printed %r)" % (machine["name"], arch))
-            image = prepare_image(repo, target)
+            binds = resolved_binds(machine, done.stdout)
+            if not args.dry_run:
+                image = prepare_image(repo, target)
         environment, digest, build = identity(machine, commit, recipe, image and image["key"])
         submission = core.new_submission_id()
         inputs = {name: core.sha256_file(file) for name, file in sorted(files_in.items())}
@@ -611,7 +678,7 @@ def submit(args, prepare):
         job = {"schema": core.SCHEMA, "submission": submission, "machine": machine["name"], "kind": machine["kind"],
                "commit": commit, "build": build, "image_digest": digest, "count": len(commands),
                "seconds": core.timeout_seconds(hours), "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus,
-               "setup": machine["setup"], "no_build": bool(args.no_build)}
+               "setup": machine["setup"], "no_build": bool(args.no_build), "binds": binds}
         if image and image.get("sif"):
             job["container"] = {"key": image["key"], "sif": image["sif"], "stamp": image["stamp"]}
         elif image:
@@ -620,7 +687,7 @@ def submit(args, prepare):
         plan = {"submission": submission, "machine": machine["name"], "kind": machine["kind"],
                 "host": machine["host"], "workdir": workdir, "commit": commit, "children": len(commands),
                 "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus, "hours": str(hours), "build": build,
-                "no_build": bool(args.no_build), "image_digest": digest, "vars": template["vars"],
+                "no_build": bool(args.no_build), "binds": binds, "image_digest": digest, "vars": template["vars"],
                 "template_sha256": template["sha256"], "commands": commands, "machines_file": machine["file"],
                 "section": {key: value for key, value in machine.items() if key != "file"}}
         if machine["container"] and not image:
@@ -1068,7 +1135,13 @@ def doctor(repo, name, row, extra=None):
         row(label, ok, detail)
     if machine["container"] and machine["container"] != "apptainer":
         try:
-            existing_image(machine)
+            found = existing_image(machine)
             row("image", True, machine["container"])
         except Refusal as error:
             row("image", False, str(error))
+            found = None
+        if found and machine["binds"]:
+            try:
+                row("binds", True, ", ".join(resolved_binds(machine, found["output"])))
+            except Refusal as error:
+                row("binds", False, str(error))

@@ -76,6 +76,7 @@ deployment and cannot be a section.
 | `setup` | both | shell lines run first, in your home directory, one per line: module loads, a venv (none) |
 | `container` | both | `apptainer` runs commands in your project's toolchain image, or the path of a `.sif` image already on the machine, such as `~/mirage.sif` ([below](#containers)) (none) |
 | `use` | both | a note on what the machine is for and when to ask before using it; `cloudsweep machines` shows it (none) |
+| `binds` | both | with a container: host paths its commands see, `SRC[:DEST[:ro\|rw]]`, comma-separated ([below](#containers)) (none) |
 | `vars` | both | `NAME=VALUE` pairs, comma-separated or one per line, that commands use as `{var:NAME}` ([below](#variables)) (none) |
 | `sbatch`, `cpu_sbatch`, `gpu_sbatch` | slurm | extra `sbatch` options for every job, CPU jobs and GPU jobs: account, partition (none) |
 | `gpu_type` | slurm | GPU type to request, such as `h100` (any) |
@@ -227,10 +228,17 @@ A build or a command sees only:
   records, read only, and its own submission's results (other submissions' are not visible);
 - `/opt/cloudsweep`, cloudsweep's worker, with an image already on the machine;
 - `/tmp` and `/var/tmp`;
-- the paths the site's `apptainer.conf` binds, such as `/etc/localtime` and `/etc/hosts`.
+- the paths the site's `apptainer.conf` binds, such as `/etc/localtime` and `/etc/hosts`;
+- the section's `binds`, for commands only (not the build, which depends only on the image and the
+  checkout).
 
-Your home directory, `workdir` and the site's other file systems are not visible. A program or data
-there must be bound in by a `setup` line, for example `export APPTAINER_BIND=/projects/me/models`.
+Your home directory, `workdir` and the site's other file systems are not visible unless bound. Give
+a program or data there in `binds`, for example `binds = ~/venvs/serve, /projects/me/models:/models:ro`:
+each SRC is absolute or starts with `~/` (expanded on the machine), DEST defaults to SRC, and the
+mode is `rw` unless `ro` is given. `submit` tests every SRC on the machine, in the call it makes for
+the image, and refuses the submission if one is missing, so a typo is caught before a job waits in
+a queue; the receipt records the binds as resolved. A DEST at or around `/work`, `/store` or
+`/opt/cloudsweep` is refused.
 
 ## What happens
 
