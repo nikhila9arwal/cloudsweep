@@ -21,6 +21,7 @@ WORKDIR holds:
   cancel  stop each submission's job, or keep it from starting
   list    the store objects of a submission, for fetch
   check   what this machine provides (cloudsweep doctor --on)
+  exec    run one quick check in a job's environment (cloudsweep exec)
 """
 
 import sys
@@ -525,6 +526,86 @@ def child(site, index=None):
         shutil.rmtree(str(scratch), ignore_errors=True)
 
 
+def placeholders(argv, values):
+    """exec's last pass: {out} and {index}; {{ and }} become braces."""
+    def replace(match):
+        if match.group(0) in ("{{", "}}"):
+            return match.group(0)[0]
+        core.require(match.group(1) in values, "exec does not provide %s" % match.group(0))
+        return values[match.group(1)]
+    return [core.PLACEHOLDER_RE.sub(replace, arg) for arg in argv]
+
+
+def run_exec(root, spec):
+    """One quick check (cloudsweep exec): the command in the environment a job's command gets on
+    this machine, with a scratch /work and an empty store, no GPU and no checkout, within the time
+    limit, which is enforced here, whatever happens to the connection. Exit: the command's code,
+    128+N for a signal N, 124 at the time limit, 125 when it could not start."""
+    base = Path(tempfile.mkdtemp(prefix="cloudsweep-exec-"))
+    work, store = base / "work", base / "store"
+    try:
+        (work / "out").mkdir(parents=True)
+        store.mkdir()
+        env = dict(spec["env"], CLOUDSWEEP_TIME_LIMIT=str(spec["timeout"]))
+        container, child_env = spec.get("container"), None
+        if container:
+            image = Path(os.path.expanduser(container["sif"])) if container.get("sif") else \
+                Path(root).resolve() / "images" / container["key"] / "base.sif"
+            core.require(image.is_file(), "the image %s is not on this machine" % image)
+            argv = [apptainer(), "exec", "--cleanenv", "--home", "%s:/work" % work, "--no-mount", "cwd",
+                    "--pwd", "/work"]
+            if container.get("sif"):  # as for a job: the machine's own image gets cloudsweep's worker
+                argv += ["--bind", "%s:/opt/cloudsweep" % HERE]
+            for bind in spec["binds"] + ["%s:/store" % store]:
+                argv += ["--bind", bind]
+            env["CLOUDSWEEP_STORE"] = "file:///store"
+            for name, value in sorted(env.items()):
+                argv += ["--env", "%s=%s" % (name, value)]
+            command = argv + [str(image)] + placeholders(spec["argv"], {"out": "/work/out", "index": "0"})
+        else:
+            command = placeholders(spec["argv"], {"out": str(work / "out"), "index": "0"})
+            child_env = dict(os.environ, CLOUDSWEEP_WORK=str(work), CLOUDSWEEP_STORE="file://" + str(store),
+                             CUDA_VISIBLE_DEVICES="", **env)
+        process = subprocess.Popen(command, cwd=str(work), env=child_env, stdin=subprocess.DEVNULL,
+                                   start_new_session=True)
+    except (OSError, ValueError) as error:
+        shutil.rmtree(str(base), ignore_errors=True)
+        print("cloudsweep: exec could not start: %s" % error, file=sys.stderr)
+        return 125
+    stops = []
+
+    def stop(signum, frame):  # a dropped connection (SIGHUP) or an interrupt: stop the command
+        stops.append(signum)
+    for signum in (signal.SIGHUP, signal.SIGINT, signal.SIGTERM):
+        signal.signal(signum, stop)
+    deadline, code = time.monotonic() + spec["timeout"], None
+    try:
+        while code is None and not stops and time.monotonic() < deadline:
+            try:
+                code = process.wait(timeout=0.2)
+            except subprocess.TimeoutExpired:
+                pass
+        if code is None:
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                code = process.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+            except OSError:
+                pass
+            code = 124 if not stops else 128 + stops[0]
+            print("cloudsweep: exec stopped the command (%s)" % ("time limit of %d s" % spec["timeout"] if code == 124
+                                                                else "signal %d" % stops[0]), file=sys.stderr)
+    finally:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)  # anything the command left behind
+        except OSError:
+            pass
+        shutil.rmtree(str(base), ignore_errors=True)
+    return 128 - code if code < 0 else code
+
+
 def copy_tree(source, target):
     """Copy the built checkout: contents, permission bits and symbolic links, nothing else. Extended
     attributes do not travel: a shared filesystem's (Lustre's, for one) are refused by local disk."""
@@ -888,7 +969,7 @@ def check(root, kind, gpus_wanted, container):
 
 
 def main(argv):
-    actions = ("submit", "child", "pool", "status", "cancel", "list", "check")
+    actions = ("submit", "child", "pool", "status", "cancel", "list", "check", "exec")
     if len(argv) < 2 or argv[0] not in actions:
         print(__doc__, file=sys.stderr)
         return 2
@@ -902,6 +983,8 @@ def main(argv):
             return listing(root, rest[0])
         if action == "check":
             return check(root, rest[0], rest[1] == "1", rest[2] == "1")
+        if action == "exec":
+            return run_exec(root, json.loads(rest[0]))
         site = Site(root, rest[0])
         if action == "child":
             return child(site, int(rest[1]) if len(rest) > 1 else None)

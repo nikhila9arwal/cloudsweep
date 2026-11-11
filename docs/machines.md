@@ -298,6 +298,23 @@ the image, and refuses the submission if one is missing, so a typo is caught bef
 a queue; the receipt records the binds as resolved. A DEST at or around `/work`, `/store` or
 `/opt/cloudsweep` is refused.
 
+### Checking the job's environment: `exec`
+
+```bash
+cloudsweep exec --on ece-gpu -- sh -c 'ls {var:venv}/bin/python; python3 --version; ls /models'
+```
+
+`cloudsweep exec --on MACHINE -- CMD` runs one quick check, on a cluster's login node or on the
+machine, in what a job's command gets there: the same image, setup lines, binds, starting folder
+and worker variables, with an empty scratch `/work` and `/store`, no GPU (natively,
+`CUDA_VISIBLE_DEVICES` is empty) and no checkout. Use it to check paths, binds and the interpreter
+before a job waits in a queue. Its output streams and its exit code is the command's (128+N for a
+signal N); 124 means the time limit (`--timeout`, 60 seconds by default, at most 600) stopped it, 125
+that cloudsweep could not start it, 255 that the connection was lost (the time limit then stops it on
+the machine). It resolves `{machine}`, `{var:NAME}`, `{index}` (0) and `{out}`; `{src}`, `{bin}` and
+`{input:NAME}` are refused. With `container = apptainer`, it uses the image a submission placed
+there for the current `[image]` recipe, and refuses if there is none: it never builds.
+
 ## What happens
 
 1. `submit` copies a clean checkout of the commit, the inputs (by content hash) and the submission

@@ -60,6 +60,11 @@
   every decision, in UTC, in `.cloudsweep/races/` and in the copies' receipts before acting on it,
   cancels the other copies and records what each used, and resumes when run again. `status` shows a
   copy's race.
+- `cloudsweep exec --on MACHINE -- CMD` runs one quick check on a cluster's login node or a machine,
+  in the environment a job's command gets there (image, setup lines, binds, starting folder, worker
+  variables), with no GPU and no checkout, within a time limit enforced on the machine; output
+  streams and its exit code is the command's. A missing bind refuses it. A submission with
+  `container = apptainer` now records its image's key, platform and recipe hash, which `exec` uses.
 
 ## 0.2.2 (2026-11-09)
 

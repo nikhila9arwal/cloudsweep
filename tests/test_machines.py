@@ -8,6 +8,8 @@ import json
 import os
 import re
 import shutil
+import signal
+import subprocess
 import sys
 import tempfile
 import threading
@@ -413,6 +415,68 @@ class MachineTests(MachineFixture):
         self.assertEqual(seen["capped"], ("1", 1))
         self.assertEqual(seen["cluster"], (str(min(8, cpus)), 8))  # Slurm's login nodes: 8 by default
         self.assertIsNone(machines.load(self.repo, "box")["build_cpus"])  # ssh machines: no cap by default
+
+    def test_exec_runs_one_check_in_the_machine_s_environment(self):
+        seen = self.root / "seen.txt"
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("\n[local]\nworkdir = %s/local\nvars = data=/data/a\n" % self.root)
+        code, out = self.cli("exec", "--", "sh", "-c", "echo $CLOUDSWEEP_TIME_LIMIT {index} {machine} {var:data} "
+                             "[$CUDA_VISIBLE_DEVICES] $AWS_BATCH_JOB_ID {{x}} > %s; test -d {out}; pwd >> %s" % (seen, seen))
+        self.assertEqual(code, 0, out)
+        lines = seen.read_text().splitlines()
+        self.assertEqual(lines[0], "60 0 local /data/a [] exec:local {x}")
+        self.assertFalse(Path(lines[1]).exists())  # the scratch directory is removed afterwards
+        self.assertEqual(self.cli("exec", "--", "sh", "-c", "exit 7")[0], 7)
+        began = time.monotonic()
+        self.assertEqual(self.cli("exec", "--timeout", "1", "--", "sleep", "30")[0], 124)
+        self.assertLess(time.monotonic() - began, 15)
+        code, out = self.cli("exec", "--", "cat", "{src}/x")
+        self.assertEqual(code, 125)
+        self.assertIn("exec has no checkout", out)
+        self.assertEqual(self.cli("exec", "--on", "aws", "--", "true")[0], 125)
+        self.assertIn("--timeout must be 1 to 600", self.cli("exec", "--timeout", "601", "--", "true")[1])
+
+    def test_exec_passes_its_command_s_code_on_and_maps_setup_failures_to_125(self):
+        record = self.root / "runs.txt"
+        self.assertEqual(self.cli("exec", "--", "sh", "-c", "echo ran >> %s; exit 97" % record)[0], 97)
+        self.assertEqual(record.read_text(), "ran\n")  # once: 97 is the command's, not a signal to retry
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("\n[local]\nworkdir = %s/local\nsetup = false\n" % self.root)
+        self.assertEqual(self.cli("exec", "--", "sh", "-c", "echo ran >> %s" % record)[0], 125)
+        self.assertEqual(record.read_text(), "ran\n")
+
+    def test_an_interrupted_exec_stops_its_command(self):
+        pid = self.root / "pid.txt"
+        process = subprocess.Popen([sys.executable, "-m", "cloudsweep", "exec", "--", "sh", "-c",
+                                    "echo $$ > %s; exec sleep 30" % pid], cwd=str(self.repo), start_new_session=True,
+                                   env=dict(os.environ, PYTHONPATH=str(PACKAGE.parent)))
+        for _ in range(100):
+            if pid.is_file() and pid.read_text().strip():
+                break
+            time.sleep(0.1)
+        os.killpg(process.pid, signal.SIGINT)  # Ctrl-C reaches the terminal's whole process group
+        self.assertEqual(process.wait(timeout=30), 130)
+        command = int(pid.read_text())
+        for _ in range(50):
+            if not os.path.exists("/proc/%d" % command):
+                break
+            time.sleep(0.1)
+        self.assertFalse(os.path.exists("/proc/%d" % command))  # the command does not outlive the exec
+
+    def test_a_second_interrupt_leaves_exec_to_stop_its_command(self):
+        pid = self.root / "pid.txt"
+        process = subprocess.Popen([sys.executable, "-m", "cloudsweep", "exec", "--", "sh", "-c",
+                                    "trap '' TERM; echo $$ > %s; while :; do sleep 1; done" % pid], cwd=str(self.repo),
+                                   start_new_session=True, env=dict(os.environ, PYTHONPATH=str(PACKAGE.parent)))
+        for _ in range(100):
+            if pid.is_file() and pid.read_text().strip():
+                break
+            time.sleep(0.1)
+        os.killpg(process.pid, signal.SIGINT)
+        time.sleep(0.5)
+        os.killpg(process.pid, signal.SIGINT)  # again, while exec waits for the command to stop
+        self.assertEqual(process.wait(timeout=60), 130)
+        self.assertFalse(os.path.exists("/proc/%d" % int(pid.read_text())))  # killed, though it ignored SIGTERM
 
     def test_gpu_commands_get_one_slot_per_gpu(self):
         submission, out = self.submit("gpubox", "--gpus", "1")
@@ -963,7 +1027,7 @@ while args[index].startswith("--"):
     clean = clean or flag == "--cleanenv"
 if "--home" in " ".join(args) and fixed != {{"--no-mount": "cwd", "--pwd": "/work"}}:
     sys.exit("the container would also see the directory it was started from")
-if "/store" in binds:
+if "/store" in binds and os.path.isdir(os.path.join(binds["/store"], "runs")):
     sys.exit("the whole store is bound; a command sees only its own submission's")
 with open(os.environ["FAKE_LOG"], "a") as log:  # submission ids as SUB
     log.write("apptainer exec %s\\n" % re.sub(r"20[0-9]{{6}}T[0-9]{{6}}Z-[0-9a-f]{{6}}", "SUB", " ".join(sorted(binds))))
@@ -973,7 +1037,7 @@ base.update(env)
 if "/work" in binds:  # the container's paths, as host paths
     base["CLOUDSWEEP_WORK"] = binds["/work"]
 if base.get("CLOUDSWEEP_STORE") == "file:///store":  # the store the narrowed binds come from
-    base["CLOUDSWEEP_STORE"] = "file://" + binds["/store/inputs"][:-len("/inputs")]
+    base["CLOUDSWEEP_STORE"] = "file://" + (binds.get("/store") or binds["/store/inputs"][:-len("/inputs")])
 if command[:2] == ["python3", "/opt/cloudsweep/worker.py"]:
     command = [sys.executable, os.environ["FAKE_WORKER"]] + command[2:]
 os.execvpe(command[0], command, base)
@@ -1131,6 +1195,26 @@ class ContainerTests(MachineFixture):
         file.write_text("[m]\nkind = ssh\nbinds = /data\n")
         with self.assertRaisesRegex(project.Refusal, "binds need a container"):
             machines.load(self.repo, "m")
+
+    def test_exec_runs_in_the_container_a_command_gets_and_refuses_a_missing_bind(self):
+        (self.home / "models").mkdir()
+        self.given_image()
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("binds = ~/models:/models:ro\n")
+        seen = self.root / "seen.txt"
+        code, out = self.cli("exec", "--on", "given", "--", "sh", "-c", "echo $CLOUDSWEEP_STORE {out} > %s" % seen)
+        self.assertEqual(code, 0, out)
+        self.assertEqual(seen.read_text().split()[1], "/work/out")
+        self.assertIn("apptainer exec /models /opt/cloudsweep /store /work\n", self.log.read_text())  # binds, empty store
+        (self.home / "models").rmdir()
+        code, out = self.cli("exec", "--on", "given", "--", "true")
+        self.assertEqual(code, 125)
+        self.assertIn("binds: ~/models does not exist on given", out)
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("\n[built]\nkind = ssh\nhost = fakehost\nworkdir = %s/built\ncontainer = apptainer\n" % self.root)
+        code, out = self.cli("exec", "--on", "built", "--", "true")
+        self.assertEqual(code, 125)
+        self.assertIn("no image of the current [image] recipe", out)
 
     def test_an_image_replaced_after_its_submission_is_refused(self):
         self.given_image()

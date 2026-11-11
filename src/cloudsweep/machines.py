@@ -28,6 +28,7 @@ import posixpath
 import re
 import shlex
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -283,12 +284,16 @@ def identity(machine, commit, recipe, image=None):
     """Synthetic sha256 digests in place of AWS's registry digests: the machine's environment (its
     host, setup lines and container image, if any), and the revision built in it. Returns them with
     the build directory's name; sections for the same host and setup share builds."""
-    host = machine["host"] if machine["host"] != LOCAL else "local:" + socket.gethostname()
-    environment = "sha256:" + core.sha256_bytes(json.dumps({"schema": core.SCHEMA, "host": host,
-                                                            "setup": machine["setup"], "image": image},
-                                                           sort_keys=True, separators=(",", ":")).encode())
+    environment = environment_digest(machine, image)
     key = core.build_key(commit, environment, recipe)
     return environment, "sha256:" + key, key[:16]
+
+
+def environment_digest(machine, image=None):
+    """The machine's environment: its host, setup lines and container image (key), if any."""
+    host = machine["host"] if machine["host"] != LOCAL else "local:" + socket.gethostname()
+    return "sha256:" + core.sha256_bytes(json.dumps({"schema": core.SCHEMA, "host": host, "setup": machine["setup"],
+                                                     "image": image}, sort_keys=True, separators=(",", ":")).encode())
 
 
 def builds_here(target):
@@ -337,12 +342,19 @@ def prepare_image(repo, target):
         key = image_id.split(":", 1)[1][:16]
         exact = "localhost/cloudsweep-image:%s" % key  # a concurrent build may move tag; this names the image
         engine.engine("tag", image_id, exact)
-        return {"key": key, "tag": exact, "spec": spec}
+        return {"key": key, "tag": exact, "spec": spec, "recipe_sha256": recipe_digest(spec, target)}
+    recipe = recipe_digest(spec, target)
+    return {"key": recipe[:16], "tag": None, "spec": spec, "recipe_sha256": recipe}
+
+
+def recipe_digest(spec, target):
+    """What an image is made from, for one architecture: the Dockerfile, its context, the check
+    and cloudsweep's worker layer. Two images with one digest come from the same recipe."""
     digest = hashlib.sha256(json.dumps([target, engine.WORKER_LAYER, spec["check"]]).encode())
     for path in [spec["dockerfile"]] + context_files(spec["context"]) + \
             [engine.HERE / file for file in engine.WORKER_FILES]:
         digest.update(b"%s\0%o\0" % (str(path).encode(), Path(path).stat().st_mode) + Path(path).read_bytes())
-    return {"key": digest.hexdigest()[:16], "tag": None, "spec": spec}
+    return digest.hexdigest()
 
 
 def context_files(context):
@@ -729,6 +741,7 @@ def submit(args, prepare):
         elif image:
             plan["container"] = "apptainer, image %s built %s" % (image["key"], "here" if image["tag"] else
                                                                   "on the machine (this host cannot build for it)")
+            plan["image"] = {"key": image["key"], "platform": target, "recipe_sha256": image["recipe_sha256"]}
         if machine["kind"] == "slurm":
             job.update(sbatch=machine["sbatch"] + machine["gpu_sbatch" if gpus else "cpu_sbatch"] +
                        (["--partition=" + args.partition] if args.partition else []), gpu_type=machine["gpu_type"])
@@ -1192,6 +1205,115 @@ def fetch_results(args, machine):
             print(accounting_text(summary["accounting"]))
     fetch.print_summary(summary, destination)
     return 0 if summary["complete"] else 1
+
+
+EXEC_LIMIT = 600  # seconds an exec may last at most
+NO_CHECKOUT = ("src", "bin")
+
+
+def exec_command(args):
+    """cloudsweep exec --on MACHINE -- CMD: run one quick check on the machine, in the environment
+    a job's command gets there (its container, setup lines, binds and worker variables), with no
+    GPU and no checkout; its output streams and its exit code is the command's."""
+    repo = project.repository()
+    try:
+        if args.on == AWS:
+            raise Refusal("exec runs on machines; AWS has no login node to run it on")
+        machine = load(repo, args.on or LOCAL, args.machines)
+        if args.command[:1] == ["--"]:
+            args.command = args.command[1:]
+        if not args.command:
+            raise Refusal("give the command after --")
+        if not 1 <= args.timeout <= EXEC_LIMIT:
+            raise Refusal("--timeout must be 1 to %d seconds; exec is for quick checks" % EXEC_LIMIT)
+        from .submit import resolve_machine  # it builds on this module
+        text, _ = resolve_machine(json.dumps(args.command), machine)
+        argv = json.loads(text)
+        for arg in argv:
+            for match in core.PLACEHOLDER_RE.finditer(arg):
+                name = match.group(1)
+                if match.group(0) in ("{{", "}}") or name in ("out", "index"):
+                    continue
+                if name in NO_CHECKOUT or (name or "").startswith("input:"):
+                    raise Refusal("exec has no checkout: {src}, {bin} and {input:NAME} are for submissions")
+                raise Refusal("unknown placeholder %s (exec has {out}, {index}, {machine} and {var:NAME})"
+                              % match.group(0))
+        spec = {"argv": argv, "timeout": args.timeout, "binds": [], "container": None,
+                "env": {"AWS_BATCH_JOB_ARRAY_INDEX": "0", "AWS_BATCH_JOB_ATTEMPT": "1",
+                        "AWS_BATCH_JOB_ID": "exec:" + machine["name"]}}
+        image_key = None
+        if machine["container"] and machine["container"] != "apptainer":
+            found = existing_image(machine)
+            spec["binds"], spec["container"], image_key = resolved_binds(machine, found["output"]), \
+                {"sif": found["sif"]}, found["key"]
+        elif machine["container"]:
+            image_key = recorded_image(repo, machine, spec)
+            spec["container"] = {"key": image_key}
+        spec["env"]["IMAGE_DIGEST"] = environment_digest(machine, image_key)
+    except Refusal as error:
+        print("cloudsweep: %s" % error, file=sys.stderr)
+        return 125
+    files_code = code_files()
+    program = "%s/code/%s/remote.py" % (machine["workdir"], code_hash(files_code))
+    # A failing setup line, or no python3, means the command never started: 125, as for any failure
+    # before it; the command's own exit code is passed on as it is.
+    script = "\n".join(["set -e", "trap 'exit 125' ERR"] + machine["setup"] + [
+        "trap - ERR", "command -v python3 > /dev/null || exit 125",
+        "exec python3 %s exec %s %s" % (program, machine["workdir"], shlex.quote(json.dumps(spec)))])
+    argv = ["bash", "-lc", script] if machine["host"] == LOCAL else ["ssh", machine["host"],
+                                                                    "bash -lc " + shlex.quote(script)]
+    try:
+        if ssh(machine, "[ -f %s ]" % program).returncode:
+            upload_code(machine, files_code)
+        process = subprocess.Popen(argv, stdin=subprocess.DEVNULL, cwd=str(Path.home()))
+    except (Refusal, OSError) as error:
+        print("cloudsweep: %s" % error, file=sys.stderr)
+        return 125
+    try:
+        return process.wait()
+    except KeyboardInterrupt:  # remote.py stops the command, and must be left to finish doing so
+        previous = signal.signal(signal.SIGINT, signal.SIG_IGN)  # another Ctrl-C must not cut that short
+        try:
+            process.send_signal(signal.SIGINT)
+            process.wait(timeout=30)  # its own limit: SIGTERM, then SIGKILL 10 s later
+        except subprocess.TimeoutExpired:
+            process.kill()
+        finally:
+            signal.signal(signal.SIGINT, previous)
+        return 130
+
+
+def recorded_image(repo, machine, spec):
+    """For container = apptainer: the latest image a submission placed on this machine (same
+    host and workdir) for its architecture and the current [image] recipe, still there; exec never
+    builds one. The same call tests the section's binds."""
+    lines = bind_lines(machine) + ["for f in %s/images/*/base.sif; do [ -f \"$f\" ] && echo CLOUDSWEEP-IMAGE "
+                                   "$(basename $(dirname \"$f\")); done; true" % machine["workdir"], "uname -m"]
+    done = ssh(machine, "\n".join(lines))
+    arch = done.stdout.split()
+    target = PLATFORM_OF.get(arch[-1] if arch else "")
+    if not target:
+        raise Refusal("cannot tell %s's architecture (uname -m printed %r)" % (machine["name"], arch))
+    spec["binds"] = resolved_binds(machine, done.stdout)
+    present = {line.split()[1] for line in done.stdout.splitlines() if line.startswith("CLOUDSWEEP-IMAGE ")}
+    config = project.load(repo)
+    recipe = recipe_digest(dict(project.image(config, repo), platform=target), target)
+    place = (machine["host"], machine["workdir"])
+    candidates = []
+    directory = settings.state_dir(repo) / "receipts"
+    for file in sorted(directory.glob("*.json"), reverse=True) if directory.is_dir() else []:
+        try:
+            receipt = json.loads(file.read_text())
+        except (OSError, ValueError):
+            continue
+        section, image = receipt.get("section") or {}, receipt.get("image") or {}
+        if (section.get("host"), section.get("workdir")) == place and image.get("platform") == target and \
+                image.get("recipe_sha256") == recipe and image.get("key") in present:
+            candidates.append(image["key"])
+    if not candidates:
+        raise Refusal("no image of the current [image] recipe for %s is on %s yet; a submission there places it "
+                      "(exec never builds one)" % (target, machine["name"]))
+    return candidates[0]
 
 
 def doctor(repo, name, row, extra=None):

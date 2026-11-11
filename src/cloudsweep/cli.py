@@ -147,6 +147,14 @@ def main(argv=None):
     status.add_arguments(commands)
     fetch.add_arguments(commands)
     race.add_arguments(commands)
+    running = commands.add_parser("exec", help="run one quick check in a machine's job environment (no GPU)",
+                                  description=machines.exec_command.__doc__)
+    running.add_argument("--on", metavar="MACHINE", help="local (the default) or a machine from machines.ini")
+    running.add_argument("--timeout", type=int, default=60, metavar="SECONDS",
+                         help="stop the command after this long (default 60, at most %d)" % machines.EXEC_LIMIT)
+    machines.add_file_argument(running)
+    running.add_argument("command", nargs=argparse.REMAINDER, help="after --: the command's argv")
+    running.set_defaults(handler=machines.exec_command)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
         return args.handler(args)
