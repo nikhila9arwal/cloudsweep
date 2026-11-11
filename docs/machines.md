@@ -104,6 +104,23 @@ On Slurm, a GPU job adds `gpu_sbatch` and `--gpus-per-node=[gpu_type:]N`, and a 
 `cpu_sbatch`. In an ssh pool each GPU command gets its own N GPUs through `CUDA_VISIBLE_DEVICES`.
 The AWS queue has no GPUs and refuses GPU commands.
 
+## Watching a job on Slurm
+
+```text
+$ cloudsweep status 20261111T120000Z-1a2b3c 20261111T130000Z-4d5e6f     # illustrative output
+ece-gpu (slurm, ece-gpu:cloudsweep)
+  20261111T120000Z-1a2b3c PENDING children {"waiting": 2} (Slurm job 1001: 2 pending (JobHeldUser), no start estimate)
+  20261111T130000Z-4d5e6f RUNNING children {"running": 1} (Slurm job 1002: 1 running on node07 since 2026-11-11T13:05:40Z)
+```
+
+For a job in Slurm's queue, `status` shows each state's tasks: a pending task's reason (`Priority`,
+`Resources`, `JobHeldUser`, ...) and Slurm's estimated start, or `no start estimate` when Slurm
+gives none (`N/A`, as on clusters without backfill estimates), and a running task's node and start.
+
+Times are UTC. Slurm prints the cluster's local time, so cloudsweep runs `squeue` with `TZ=UTC` and
+`SLURM_TIME_FORMAT=standard`. `status --json` gives them as `queue` (task, state, reason, start,
+nodes; for a pending task its start is the estimate and its nodes those Slurm expects to use).
+
 ## Containers
 
 By default commands use the machine's own software. Add `container = apptainer` to a machine's

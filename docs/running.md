@@ -83,6 +83,9 @@ cloudsweep status --on aws            # submissions in the AWS queue's history, 
 cloudsweep status --storage           # retained AWS bucket objects and registry images
 ```
 
+On a Slurm machine, `status` also shows why a job waits (Slurm's pending reason), its estimated
+start and its node, in UTC ([watching a job on Slurm](machines.md#watching-a-job-on-slurm)).
+
 On AWS, desired capacity is what Batch requested, not the number of running instances. Spend comes from
 the guard's [budget snapshot](admin.md#costs-and-limits) and lags usage. Status remains available
 when cloud use is off or the cutoff is active.

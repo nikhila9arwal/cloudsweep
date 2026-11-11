@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- `status` on a Slurm machine shows why each pending task waits (Slurm's reason), Slurm's estimated
+  start or `no start estimate`, and each running task's node and start; `--json` carries them as
+  `queue`. Times are UTC: `squeue` runs with `TZ=UTC` and `SLURM_TIME_FORMAT=standard`, since
+  clusters print their local time.
+
 ## 0.2.2 (2026-11-09)
 
 - An image for a machine of another architecture is built here only when containers here can run

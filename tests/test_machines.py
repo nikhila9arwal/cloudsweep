@@ -2,6 +2,7 @@
 command here (so real rsync works through it), and fake sbatch runs an array's tasks in order,
 as Slurm would."""
 
+import calendar
 import io
 import json
 import os
@@ -87,11 +88,29 @@ last = int(re.search(r"#SBATCH --array=0-(\\d+)", text).group(1))
 output = re.search(r"#SBATCH --output=(\\S+)", text).group(1)
 with open(os.environ["FAKE_LOG"], "a") as log:
     log.write("sbatch %s\\n" % json.dumps(flags))
+if os.environ.get("FAKE_HOLD"):  # queued: the test says what squeue shows
+    print("4242")
+    sys.exit(0)
 for index in range(last + 1):
     env = dict(os.environ, SLURM_ARRAY_TASK_ID=str(index), SLURM_ARRAY_JOB_ID="4242", SLURM_SUBMIT_DIR=os.getcwd())
     with open(output.replace("%a", str(index)), "ab") as out:
         subprocess.run(["/bin/bash", script], env=env, stdout=out, stderr=subprocess.STDOUT)
 print("4242")
+"""
+# squeue prints FAKE_SLURM/queue.txt, where {t:EPOCH} becomes a time as
+# Slurm prints it: in the zone TZ names, and in ISO 8601 only with SLURM_TIME_FORMAT=standard.
+FAKE_REPORTER = """#!{python}
+import os, re, sys, time
+name = os.path.join(os.environ["FAKE_SLURM"], "%s")
+with open(os.environ["FAKE_LOG"], "a") as log:
+    log.write("%s\\n")
+def when(match):
+    moment = time.localtime(int(match.group(1)))
+    if os.environ.get("SLURM_TIME_FORMAT") == "standard":
+        return time.strftime("%%Y-%%m-%%dT%%H:%%M:%%S", moment)
+    return time.strftime("%%a %%H:%%M", moment)
+if os.path.exists(name):
+    sys.stdout.write(re.sub(r"\\{{t:(\\d+)\\}}", when, open(name).read()))
 """
 
 
@@ -109,21 +128,29 @@ class MachineFixture(unittest.TestCase):
         fakes = self.root / "bin"
         fakes.mkdir()
         for name, text in (("ssh", FAKE_SSH), ("sbatch", FAKE_SBATCH),
-                           ("squeue", "#!/bin/sh\n"), ("scancel", "#!/bin/sh\necho scancel \"$@\" >> \"$FAKE_LOG\"\n")):
+                           ("squeue", FAKE_REPORTER % ("queue.txt", "squeue")),
+                           ("scancel", "#!/bin/sh\necho scancel \"$@\" >> \"$FAKE_LOG\"\n")):
             (fakes / name).write_text(text.format(python=sys.executable))
             (fakes / name).chmod(0o755)
+        self.slurm = self.root / "slurm"
+        self.slurm.mkdir()
         self.home = self.root / "home"
         self.home.mkdir()
         (self.home / "cs-setup.sh").write_text("export FROM_SETUP=yes\n")  # setup paths are relative to home
         self.log = self.root / "fake.log"
         environment = {key: value for key, value in os.environ.items()
                        if key not in ("CUDA_VISIBLE_DEVICES", "XDG_CONFIG_HOME")}
-        environment.update(PATH="%s:%s" % (fakes, os.environ["PATH"]), HOME=str(self.home), FAKE_LOG=str(self.log))
+        environment.update(PATH="%s:%s" % (fakes, os.environ["PATH"]), HOME=str(self.home), FAKE_LOG=str(self.log),
+                           FAKE_SLURM=str(self.slurm))
         patcher = mock.patch.dict(os.environ, environment, clear=True)
         patcher.start()
         self.addCleanup(patcher.stop)
 
     def cli(self, *argv):
+        code, out, err = self.cli_streams(*argv)
+        return code, out + err
+
+    def cli_streams(self, *argv):
         out, old = io.StringIO(), os.getcwd()
         os.chdir(str(self.repo))
         try:
@@ -131,7 +158,7 @@ class MachineFixture(unittest.TestCase):
                 code = cli.main(list(argv))
         finally:
             os.chdir(old)
-        return code, out.getvalue() + err.getvalue()
+        return code, out.getvalue(), err.getvalue()
 
     def submit(self, machine, *extra, expect=0):
         code, out = self.cli("submit", "--on", machine, "--commands", str(self.sweep), "--input", "trace.bin", *extra)
@@ -383,6 +410,46 @@ class MachineTests(MachineFixture):
         self.assertTrue(all(core.DIGEST_RE.fullmatch(digest) for digest in first[:2] + changed[:2]))
 
 
+def utc(*when):
+    return calendar.timegm(when + (0, 0, 0))
+
+
+class SlurmTests(MachineFixture):
+    """What status reads from Slurm's queue, with fake squeue output."""
+
+    def held(self, *extra):
+        os.environ["FAKE_HOLD"] = "1"  # sbatch queues the job and runs nothing
+        submission, _ = self.submit("cluster", *extra)
+        return submission
+
+    def test_status_shows_why_tasks_wait_and_the_estimated_start_in_utc(self):
+        submission = self.held()
+        (self.slurm / "queue.txt").write_text("0|PENDING|Priority|{t:%d}||node12\n1|PENDING|None|N/A||(null)\n"
+                                              "2|PENDING||N/A||\n" % utc(2026, 11, 11, 2, 43, 0))
+        # As a cluster's login shell may leave them: another zone, and times as Tue 20:43.
+        os.environ.update(TZ="America/Chicago", SLURM_TIME_FORMAT="relative")
+        code, out = self.cli("status", submission)
+        self.assertEqual(code, 0, out)
+        self.assertIn('%s PENDING children {"waiting": 3} (Slurm job 4242: 3 pending (Priority), estimated start '
+                      '2026-11-11T02:43:00Z on node12)\n' % submission, out)
+        row = json.loads(self.cli_streams("status", "--json", submission)[1])[submission]
+        self.assertEqual(row["queue"], [
+            {"task": 0, "state": "PENDING", "reason": "Priority", "start": "2026-11-11T02:43:00Z", "nodes": "node12"},
+            {"task": 1, "state": "PENDING", "reason": None, "start": None, "nodes": None},
+            {"task": 2, "state": "PENDING", "reason": None, "start": None, "nodes": None}])
+        (self.slurm / "queue.txt").write_text("0|PENDING|JobHeldUser|N/A||(null)\n")
+        self.assertIn("(Slurm job 4242: 1 pending (JobHeldUser), no start estimate)", self.cli("status", submission)[1])
+
+    def test_a_running_task_shows_its_node_and_its_start(self):
+        submission = self.held()
+        start = utc(2026, 11, 11, 9, 12, 27)
+        (self.slurm / "queue.txt").write_text("0|RUNNING|None|{t:%d}|node02|(null)\n1|PENDING|Resources|N/A||\n"
+                                              "2|PENDING|Resources|N/A||\n" % start)
+        code, out = self.cli("status", submission)
+        self.assertIn('RUNNING children {"running": 1, "waiting": 2} (Slurm job 4242: 1 running on node02 since '
+                      '2026-11-11T09:12:27Z; 2 pending (Resources), no start estimate)', out)
+
+
 FAKE_APPTAINER = """#!{python}
 import os, shutil, sys
 args = sys.argv[1:]
@@ -579,6 +646,12 @@ class RemoteTests(unittest.TestCase):
         self.assertEqual(remote.child_state(None, None, True), "lost (started, no completion manifest)")
         self.assertEqual(remote.child_state(remote.NO_ATTEMPT, None, True), "waiting")
         self.assertEqual(remote.child_state("failed", None, False), "failed")
+
+    def test_slurm_fields_are_read_as_slurm_prints_them(self):
+        self.assertEqual([remote.slurm_value(text) for text in ("(null)", "None", "N/A", "", "None assigned", "node64")],
+                         [None, None, None, None, None, "node64"])
+        self.assertEqual(remote.slurm_time("2026-11-11T09:12:27"), "2026-11-11T09:12:27Z")
+        self.assertIsNone(remote.slurm_time("Tue 20:43"))  # not UTC in ISO 8601: never guessed
 
     def test_a_reused_process_id_is_not_taken_for_the_pool(self):
         site = mock.Mock(submission="20261106T000000Z-aaaaaa")

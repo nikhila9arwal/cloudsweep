@@ -49,6 +49,9 @@ import worker  # noqa: E402
 
 RESULT = "CLOUDSWEEP-RESULT "
 SLURM_RUNNING = ("RUNNING", "COMPLETING")
+# squeue: array task, state, reason, start (for a pending task Slurm's estimate), nodes, and the
+# nodes Slurm expects to use for a pending task.
+QUEUE_FORMAT = "%K|%T|%r|%S|%N|%Y"
 NO_ATTEMPT = object()
 
 
@@ -539,17 +542,49 @@ def latest_statuses(site):
     return found
 
 
-def slurm_tasks(job):
-    """index -> Slurm state of the array's tasks still known to the queue."""
-    done = run(["squeue", "-h", "-r", "-j", job, "-o", "%K|%T"])
+def slurm_env():
+    """Slurm prints times in the machine's local zone and in a format the user may choose; these
+    give UTC in ISO 8601 on every cluster."""
+    return dict(os.environ, TZ="UTC", SLURM_TIME_FORMAT="standard")
+
+
+def slurm_value(text):
+    """A field as Slurm prints it, or None for its ways of saying there is none."""
+    text = text.strip()
+    return None if text in ("", "None", "(null)", "N/A", "Unknown", "None assigned") else text
+
+
+def slurm_time(text):
+    """A UTC time from Slurm (TZ=UTC, standard format) as 2026-11-11T09:12:27Z, or None."""
+    text = slurm_value(text)
+    if not text or len(text) != 19 or text[10] != "T":
+        return None
+    return text + "Z"
+
+
+def slurm_queue(job):
+    """index -> {state, reason, start, nodes} for the array's tasks still in the queue. A pending
+    task's start is Slurm's estimate (None while it has none) and its nodes those Slurm expects to
+    use; a running task's are its own."""
+    done = run(["squeue", "-h", "-r", "-j", job, "-o", QUEUE_FORMAT], env=slurm_env())
     # Older Slurm rejects a job id that has left the queue instead of listing nothing.
     core.require(done.returncode == 0 or "Invalid job id" in done.stderr, "squeue failed: %s" % done.stderr.strip())
     tasks = {}
     for line in done.stdout.splitlines():
-        index, _, state = line.strip().partition("|")
-        if index.isdigit():
-            tasks[int(index)] = state
+        fields = line.strip().split("|")
+        if len(fields) < 2 or not fields[0].isdigit():
+            continue
+        fields += [""] * (6 - len(fields))
+        running = fields[1] not in ("PENDING", "REQUEUE_HOLD", "REQUEUED")
+        tasks[int(fields[0])] = {"state": fields[1], "reason": slurm_value(fields[2]),
+                                 "start": slurm_time(fields[3]),
+                                 "nodes": slurm_value(fields[4] if running else fields[5])}
     return tasks
+
+
+def slurm_tasks(job):
+    """index -> Slurm state of the array's tasks still known to the queue."""
+    return {index: task["state"] for index, task in slurm_queue(job).items()}
 
 
 def pool_alive(site, state):
@@ -584,10 +619,13 @@ def site_status(site):
     pool_active, queued = False, {}
     if site.job["kind"] == "slurm":
         job = slurm_job(site, state)
-        queued = slurm_tasks(job) if job else {}
+        tasks = slurm_queue(job) if job else {}
+        queued = {index: task["state"] for index, task in tasks.items()}
         active = bool(queued)
         report.update(job=job, state=("RUNNING" if any(v in SLURM_RUNNING for v in queued.values()) else
                                       "PENDING" if active else "FINISHED"))
+        if tasks:
+            report["queue"] = [dict(task=index, **tasks[index]) for index in sorted(tasks)]
         started = bool(job)
     else:
         if state.get("host") and state["host"] != socket.gethostname():

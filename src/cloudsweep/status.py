@@ -1,4 +1,6 @@
 """Show submissions on the machine their receipts name, or with --on on that machine (default local).
+On Slurm, also each pending task's reason and estimated start, and each running task's node
+and start, in UTC.
 With --on aws, show the AWS jobs, desired capacity and reported monthly spend, which lags usage
 by hours; that works when cloud use is off or the cutoff is active. --storage inventories the
 data retained on AWS.

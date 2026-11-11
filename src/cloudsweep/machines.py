@@ -580,11 +580,41 @@ def machine_of(repo, submission):
     return LOCAL
 
 
+def nodes_text(nodes):
+    return ", ".join(nodes[:4]) + (" and %d more" % (len(nodes) - 4) if len(nodes) > 4 else "")
+
+
+def queue_text(queue):
+    """The tasks in Slurm's queue, one phrase per state: where and since when they run, or why
+    they wait and Slurm's estimated start (times in UTC)."""
+    groups = {}
+    for task in queue:
+        groups.setdefault(task["state"], []).append(task)
+    parts = []
+    for state in sorted(groups, key=lambda name: (name != "RUNNING", name)):
+        tasks = groups[state]
+        nodes = sorted({task["nodes"] for task in tasks if task["nodes"]})
+        starts = sorted(task["start"] for task in tasks if task["start"])
+        text = "%d %s" % (len(tasks), state.lower())
+        if state == "PENDING":
+            reasons = sorted({task["reason"] for task in tasks if task["reason"]})
+            text += " (%s)" % ", ".join(reasons) if reasons else ""
+            text += ", estimated start %s" % starts[0] if starts else ", no start estimate"
+            text += " on %s" % nodes_text(nodes) if nodes else ""
+        else:
+            text += " on %s" % nodes_text(nodes) if nodes else ""
+            text += " since %s" % starts[0] if starts else ""
+        parts.append(text)
+    return "; ".join(parts)
+
+
 def describe(submission, row):
     children = " children %s" % json.dumps(row["children"], sort_keys=True) if row.get("children") else ""
     job = ""
-    if row.get("job"):
-        job = " (Slurm job %s)" % row["job"] if row.get("kind") == "slurm" else " (pool process %s)" % row["job"]
+    if row.get("job") and row.get("kind") == "slurm":
+        job = " (Slurm job %s%s)" % (row["job"], ": " + queue_text(row["queue"]) if row.get("queue") else "")
+    elif row.get("job"):
+        job = " (pool process %s)" % row["job"]
     return "  %s %s%s%s%s" % (submission, row.get("state", "UNKNOWN"), children, job,
                               " " + row["error"] if row.get("error") else "")
 

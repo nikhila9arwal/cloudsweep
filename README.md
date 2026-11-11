@@ -161,8 +161,9 @@ for. [For AI agents](docs/agents.md) has instructions to paste into your project
 
 - `cloudsweep doctor` checks the project and this host; add `--on MACHINE` for a machine, or
   `--on aws` for the AWS deployment.
-- `cloudsweep status <submission>` counts commands by state, and `fetch` names each one that
-  failed; `cloudsweep cancel <submission>` stops the work.
+- `cloudsweep status <submission>` counts commands by state (on Slurm, with the pending reason,
+  the estimated start and the node), and `fetch` names each one that failed;
+  `cloudsweep cancel <submission>` stops the work.
 - Each attempt's `stderr.txt` is in `cloudsweep-results/<submission>/<command>/<attempt>/` after
   `fetch`. On a machine, the job's logs are in `<workdir>/jobs/<submission>/logs/` there
   (`workdir` is `~/cloudsweep` unless you set it).
