@@ -606,6 +606,29 @@ class SlurmTests(MachineFixture):
         self.assertEqual((code, out), (1, ""))
         self.assertIn("--json is for machines", err)
 
+    def test_no_build_runs_the_checkout_as_committed_and_refuses_bin(self):
+        code, out = self.cli("submit", "--on", "box", "--no-build", "--commands", str(self.sweep), "--input",
+                             "trace.bin")
+        self.assertEqual(code, 1, out)  # the sweep's commands run {bin}
+        self.assertIn("--no-build: command 0 uses {bin}", out)
+        self.assertIn("--no-build is for machines", self.cli("submit", "--on", "aws", "--no-build", "--commands",
+                                                             str(self.sweep))[1])
+        self.sweep.write_text('["sh", "-c", "ls build > {out}/built.txt 2>&1; echo {{bin}} {index} > {out}/i.txt"]\n')
+        submission, out = self.submit("box", "--no-build")
+        self.assertTrue(self.receipt(submission)["no_build"])
+        self.wait_for_pool(self.root / "box", submission)
+        destination = self.root / "results"
+        self.assertEqual(self.cli("fetch", submission, str(destination))[0], 0)
+        self.assertIn("No such file", (destination / submission / "0/1/out/built.txt").read_text())
+        self.assertEqual((destination / submission / "0/1/out/i.txt").read_text(), "{bin} 0\n")
+        record = json.loads((self.root / "box/builds" / self.receipt(submission)["build"] / "build.json").read_text())
+        self.assertEqual(record["recipe"], {"command": "", "binary": None})
+        self.assertNotIn("mkdir -p build", (self.root / "box/builds" / self.receipt(submission)["build"] /
+                                            "build.log").read_text())
+        built, _ = self.submit("box")  # the same commit, built: another build directory
+        self.assertNotEqual(self.receipt(built)["build"], self.receipt(submission)["build"])
+        self.assertFalse(self.receipt(built)["no_build"])
+
 
 class BillingTests(unittest.TestCase):
     """The units of a request under a partition's TRESBillingWeights, as Slurm computes them."""

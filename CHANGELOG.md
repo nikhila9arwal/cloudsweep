@@ -20,6 +20,8 @@
   built when you submit.
 - `submit --json` on a machine prints one JSON object: the receipt, which has every field of the
   dry run, with its path. `submit --dry-run --json` prints the plan with the batch script in it.
+- `submit --no-build` on a machine runs the commands in the checkout as committed without
+  `[build] command`; a command that uses `{bin}` is refused, and the receipt records it.
 - **Changed:** a container on a machine starts with `--no-mount cwd --pwd /work`, so a build or
   command sees the same paths wherever it was started: `/work`, `/store`, `/opt/cloudsweep` (with
   an image already on the machine), `/tmp`, `/var/tmp` and the site's binds. It no longer sees

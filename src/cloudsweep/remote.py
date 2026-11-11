@@ -279,8 +279,11 @@ def build(site):
     if not my_turn(site, lock, record, "this revision's build"):
         return False
     log = site.build / "build.log"
-    print("cloudsweep: building %s here (once per commit and setup); log %s" % (site.job["commit"][:12], log),
-          file=sys.stderr, flush=True)
+    if site.job.get("no_build"):
+        message = "preparing the checkout of %s here, without [build] command (--no-build); log %s"
+    else:
+        message = "building %s here (once per commit and setup); log %s"
+    print("cloudsweep: " + message % (site.job["commit"][:12], log), file=sys.stderr, flush=True)
     try:
         if site.job.get("container"):
             argv = in_container(site, site.build, {"GIT_OPTIONAL_LOCKS": "0"}) + ["build", "--keep-modes"]

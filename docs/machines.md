@@ -201,7 +201,9 @@ there must be bound in by a `setup` line, for example `export APPTAINER_BIND=/pr
 1. `submit` copies a clean checkout of the commit, the inputs (by content hash) and the submission
    into `workdir` with rsync. It builds the checkout there with `[build] command`, on the cluster's
    login node or on the ssh machine, once per commit, build recipe, host and `setup`. Later
-   submissions reuse the build; one that arrives while the same build runs waits for it.
+   submissions reuse the build; one that arrives while the same build runs waits for it. With
+   `--no-build`, the commands run in the checkout as committed and `[build] command` is not run; a
+   command that uses `{bin}` is then refused, and the receipt records `"no_build": true`.
 2. It starts the work. Slurm gets `--cpus-per-task` (`[run] vcpus`), `--mem` (`memory_mib`) and
    `--time` (`hours`), plus `--signal`, so a command stopped at its time limit gets up to two minutes
    to finish uploading what it wrote (best effort). The `sbatch` options in machines.ini override

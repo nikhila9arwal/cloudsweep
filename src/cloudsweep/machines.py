@@ -586,7 +586,7 @@ def submit(args, prepare):
         job = {"schema": core.SCHEMA, "submission": submission, "machine": machine["name"], "kind": machine["kind"],
                "commit": commit, "build": build, "image_digest": digest, "count": len(commands),
                "seconds": core.timeout_seconds(hours), "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus,
-               "setup": machine["setup"]}
+               "setup": machine["setup"], "no_build": bool(args.no_build)}
         if image and image.get("sif"):
             job["container"] = {"key": image["key"], "sif": image["sif"], "stamp": image["stamp"]}
         elif image:
@@ -595,7 +595,7 @@ def submit(args, prepare):
         plan = {"submission": submission, "machine": machine["name"], "kind": machine["kind"],
                 "host": machine["host"], "workdir": workdir, "commit": commit, "children": len(commands),
                 "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus, "hours": str(hours), "build": build,
-                "image_digest": digest}
+                "no_build": bool(args.no_build), "image_digest": digest}
         if machine["container"] and not image:
             plan["container"] = "apptainer; the image is built when you submit"
         if image and image.get("sif"):

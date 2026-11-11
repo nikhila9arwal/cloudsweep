@@ -60,6 +60,7 @@ for the AWS estimate, ceiling and billing gaps.
 | `--revision REV` | committed revision; default `HEAD` |
 | `--isolated` | on AWS, reserve the largest deployed instance's CPU and usable memory per command |
 | `--label TEXT` | label saved with the submission |
+| `--no-build` | on a machine, run in the checkout as committed without `[build] command`; refused when a command uses `{bin}` |
 | `--json` | on a machine, print one JSON object: the dry run's fields with the batch script, and after a submission its receipt and path |
 
 Commit tracked changes and `cloudsweep.ini` first; unknown placeholders are refused. On AWS, so

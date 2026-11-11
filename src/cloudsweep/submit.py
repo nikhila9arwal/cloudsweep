@@ -25,6 +25,11 @@ from . import core, engine, fetch, machines, project, settings
 from .project import Refusal
 
 
+def uses_bin(argv):
+    """Whether a command names {bin} ({{bin}} is literal text)."""
+    return any(match.group(1) == "bin" for arg in argv for match in core.PLACEHOLDER_RE.finditer(arg))
+
+
 def input_files(specs, roots):
     """NAME -> local path. NAME defaults to PATH relative to whichever root contains it."""
     files = {}
@@ -57,6 +62,12 @@ def prepare(args, repo):
         commands = core.parse_commands(text, files, recipe["binary"] is not None)
     except ValueError as error:
         raise Refusal(str(error))
+    if getattr(args, "no_build", False):
+        using = [index for index, argv in enumerate(commands) if uses_bin(argv)]
+        if using:
+            raise Refusal("--no-build: command %d uses {bin}, the program the build makes; submit it without "
+                          "--no-build" % using[0])
+        recipe = {"command": "", "binary": None}  # the checkout as committed; [build] command is not run
     hours = args.hours or defaults.get("hours")
     if hours is None:
         raise Refusal("give --hours (the time limit per run) or set [run] hours in cloudsweep.ini")
@@ -279,8 +290,10 @@ def route(parser, args):
     """Without --on, run on this host; --on aws takes the AWS path, any other name a machine."""
     check_command_args(parser, args)
     if args.on == machines.AWS:
-        if args.json:
-            raise Refusal("--json is for machines; on AWS, submit prints text and its receipt is JSON")
+        for flag, given in (("--json", args.json), ("--no-build", args.no_build)):
+            if given:
+                raise Refusal("%s is for machines; on AWS the revision image is always built, and submit prints "
+                              "text (its receipt is JSON)" % flag)
         return main(args)
     args.on = args.on or machines.LOCAL
     return machines.submit(args, prepare)
@@ -300,6 +313,9 @@ def add_arguments(commands):
     parser.add_argument("--isolated", action="store_true",
                         help="on AWS: reserve a whole instance of the largest type per command (timing experiments)")
     parser.add_argument("--label", default="", help="free text recorded in the manifest and receipt")
+    parser.add_argument("--no-build", action="store_true",
+                        help="on a machine: run the commands in the checkout as committed, without [build] command "
+                             "(refused when a command uses {bin}); recorded in the receipt")
     parser.add_argument("--dry-run", action="store_true",
                         help="check and plan; build, upload and submit nothing (on a machine it reads the image "
                              "and, on Slurm, the partition's billing weights)")
