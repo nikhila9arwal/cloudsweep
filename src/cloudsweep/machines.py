@@ -39,7 +39,7 @@ from . import core, engine, fetch, project, settings
 from .project import Refusal
 
 FILE = "machines.ini"
-COMMON = {"kind", "host", "workdir", "setup", "container", "use", "vars", "binds"}
+COMMON = {"kind", "host", "workdir", "setup", "container", "use", "vars", "binds", "build_cpus"}
 KEYS = {"slurm": COMMON | {"sbatch", "cpu_sbatch", "gpu_sbatch", "gpu_type"},
         "ssh": COMMON | {"slots", "gpus", "systemd"}}
 GPU_TYPE_RE = re.compile(r"[A-Za-z0-9_.-]+")
@@ -64,6 +64,8 @@ BINFMT = Path("/proc/sys/fs/binfmt_misc")
 # with the machine's Python, since stat's formats differ between coreutils implementations.
 STAMP = "import os, sys; s = os.stat(os.path.expanduser(sys.argv[1])); print('%d:%d' % (s.st_size, s.st_mtime_ns))"
 SIGNAL_SECONDS = 120  # Slurm sends SIGTERM this long before the time limit, so the worker can upload
+# A build on a Slurm machine runs on its shared login node; by default it may use this many CPUs.
+SLURM_BUILD_CPUS = 8
 
 
 def files(repo, extra=None):
@@ -168,6 +170,9 @@ def machine(name, section, where, file=None):
               "vars": variables(section.get("vars", ""), where), "binds": bind_list(section.get("binds", ""), where)}
     if result["binds"] and not container:
         raise Refusal("%s: binds need a container; without one, commands see the machine's own files" % where)
+    result["build_cpus"] = number(section, "build_cpus", where, 1)
+    if result["build_cpus"] is None and kind == "slurm":
+        result["build_cpus"] = SLURM_BUILD_CPUS
     if kind == "slurm":
         for key in ("sbatch", "cpu_sbatch", "gpu_sbatch"):
             result[key] = shlex.split(section.get(key, ""))
@@ -678,7 +683,8 @@ def submit(args, prepare):
         job = {"schema": core.SCHEMA, "submission": submission, "machine": machine["name"], "kind": machine["kind"],
                "commit": commit, "build": build, "image_digest": digest, "count": len(commands),
                "seconds": core.timeout_seconds(hours), "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus,
-               "setup": machine["setup"], "no_build": bool(args.no_build), "binds": binds}
+               "setup": machine["setup"], "no_build": bool(args.no_build), "binds": binds,
+               "build_cpus": machine["build_cpus"]}
         if image and image.get("sif"):
             job["container"] = {"key": image["key"], "sif": image["sif"], "stamp": image["stamp"]}
         elif image:
@@ -687,7 +693,8 @@ def submit(args, prepare):
         plan = {"submission": submission, "machine": machine["name"], "kind": machine["kind"],
                 "host": machine["host"], "workdir": workdir, "commit": commit, "children": len(commands),
                 "vcpus": vcpus, "memory_mib": memory_mib, "gpus": gpus, "hours": str(hours), "build": build,
-                "no_build": bool(args.no_build), "binds": binds, "image_digest": digest, "vars": template["vars"],
+                "no_build": bool(args.no_build), "build_cpus": machine["build_cpus"], "binds": binds,
+                "image_digest": digest, "vars": template["vars"],
                 "template_sha256": template["sha256"], "commands": commands, "machines_file": machine["file"],
                 "section": {key: value for key, value in machine.items() if key != "file"}}
         if machine["container"] and not image:

@@ -279,6 +279,21 @@ def build_image(site, directory, log):
     return archive
 
 
+def build_cpus(site):
+    """The CPUs the build may use under the section's build_cpus (None: no cap): that many of
+    those this process may use, from an offset the build key gives, so concurrent builds spread.
+    The build inherits the affinity, so nproc (and make -j"$(nproc)") in it, or in its container,
+    sees that many."""
+    cap = site.job.get("build_cpus")
+    if not cap or not hasattr(os, "sched_setaffinity"):
+        return None
+    allowed = sorted(os.sched_getaffinity(0))
+    if cap >= len(allowed):
+        return None
+    offset = int(site.job["build"][:8], 16) % len(allowed)
+    return set((allowed[offset:] + allowed[:offset])[:cap])
+
+
 def build(site):
     """Build the revision once in this machine's environment (or its container image); later
     submissions reuse it. A revision is built where it runs, since programs may depend on where
@@ -298,10 +313,12 @@ def build(site):
         else:
             argv = [sys.executable, "-c", "import sys; sys.path.insert(0, %r); import worker; "
                     "sys.exit(worker.build_mode(%r, writable=False))" % (str(HERE), str(site.build))]
+        cpus = build_cpus(site)
         with open(str(log), "wb") as stream_:
             process = subprocess.Popen(argv, stdin=subprocess.DEVNULL,
                                        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, cwd=str(site.build),
-                                       env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"))
+                                       env=dict(os.environ, GIT_OPTIONAL_LOCKS="0"),
+                                       preexec_fn=(lambda: os.sched_setaffinity(0, cpus)) if cpus else None)
             for line in process.stdout:
                 stream_.write(line)
                 sys.stderr.buffer.write(line)

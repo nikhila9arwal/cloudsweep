@@ -17,7 +17,7 @@ from contextlib import redirect_stdout
 from pathlib import Path
 from unittest import mock
 
-from helpers import PACKAGE, make_repo
+from helpers import PACKAGE, git, make_repo
 
 from cloudsweep import cli, core, machines, project
 
@@ -394,6 +394,25 @@ class MachineTests(MachineFixture):
         (self.repo / ".cloudsweep/machines.ini").write_text("[bad]\nkind = ssh\nvars = 1x=2\n")
         with self.assertRaisesRegex(project.Refusal, "vars must be NAME=VALUE"):
             machines.load(self.repo, "bad")
+
+    def test_build_cpus_caps_what_the_build_sees(self):
+        (self.repo / "cloudsweep.ini").write_text(INI.replace("cp sim.sh build/sim", "cp sim.sh build/sim && nproc > nproc.txt"))
+        git(self.repo, "commit", "-qam", "count the build's CPUs")
+        with open(str(self.repo / ".cloudsweep/machines.ini"), "a") as stream:
+            stream.write("\n[capped]\nkind = ssh\nhost = fakehost\nworkdir = %s/capped\nbuild_cpus = 1\n" % self.root)
+        self.sweep.write_text('["sh", "-c", "cp nproc.txt {out}/"]\n')
+        seen = {}
+        for name, workdir in (("capped", "capped"), ("cluster", "cluster")):
+            submission, _ = self.submit(name)
+            if name == "capped":
+                self.wait_for_pool(self.root / workdir, submission)
+            self.assertEqual(self.cli("fetch", submission, str(self.root / "results"))[0], 0)
+            seen[name] = ((self.root / "results" / submission / "0/1/out/nproc.txt").read_text().strip(),
+                          self.receipt(submission)["build_cpus"])
+        cpus = len(os.sched_getaffinity(0))
+        self.assertEqual(seen["capped"], ("1", 1))
+        self.assertEqual(seen["cluster"], (str(min(8, cpus)), 8))  # Slurm's login nodes: 8 by default
+        self.assertIsNone(machines.load(self.repo, "box")["build_cpus"])  # ssh machines: no cap by default
 
     def test_gpu_commands_get_one_slot_per_gpu(self):
         submission, out = self.submit("gpubox", "--gpus", "1")

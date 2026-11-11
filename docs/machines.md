@@ -76,6 +76,7 @@ deployment and cannot be a section.
 | `setup` | both | shell lines run first, in your home directory, one per line: module loads, a venv (none) |
 | `container` | both | `apptainer` runs commands in your project's toolchain image, or the path of a `.sif` image already on the machine, such as `~/mirage.sif` ([below](#containers)) (none) |
 | `use` | both | a note on what the machine is for and when to ask before using it; `cloudsweep machines` shows it (none) |
+| `build_cpus` | both | how many CPUs the build may use: `nproc` in it, and so `make -j"$(nproc)"`, sees that many (8 on `slurm`, whose builds run on a shared login node; on `ssh`, all) |
 | `binds` | both | with a container: host paths its commands see, `SRC[:DEST[:ro\|rw]]`, comma-separated ([below](#containers)) (none) |
 | `vars` | both | `NAME=VALUE` pairs, comma-separated or one per line, that commands use as `{var:NAME}` ([below](#variables)) (none) |
 | `sbatch`, `cpu_sbatch`, `gpu_sbatch` | slurm | extra `sbatch` options for every job, CPU jobs and GPU jobs: account, partition (none) |
@@ -244,8 +245,9 @@ a queue; the receipt records the binds as resolved. A DEST at or around `/work`,
 
 1. `submit` copies a clean checkout of the commit, the inputs (by content hash) and the submission
    into `workdir` with rsync. It builds the checkout there with `[build] command`, on the cluster's
-   login node or on the ssh machine, once per commit, build recipe, host and `setup`. Later
-   submissions reuse the build; one that arrives while the same build runs waits for it. With
+   login node or on the ssh machine, on at most `build_cpus` CPUs, once per commit, build recipe,
+   host and `setup`. Later submissions reuse the build; one that arrives while the same build runs
+   waits for it. With
    `--no-build`, the commands run in the checkout as committed and `[build] command` is not run; a
    command that uses `{bin}` is then refused, and the receipt records `"no_build": true`.
 2. It starts the work. Slurm gets `--cpus-per-task` (`[run] vcpus`), `--mem` (`memory_mib`) and

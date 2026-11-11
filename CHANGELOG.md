@@ -45,6 +45,10 @@
   commands (not to the build). `submit`, also in a dry run, tests each source on the machine in the
   call it makes for the image, and refuses a missing one; `doctor --on` reports them; the receipt
   records them. A destination covering cloudsweep's `/work`, `/store` or `/opt/cloudsweep` is refused.
+- **Changed:** a build uses at most `build_cpus` CPUs of the machine, a new setting, by default 8 on
+  Slurm machines (whose builds run on a shared login node) and all on ssh machines. The build's CPU
+  affinity is set, so `nproc`, and with it `make -j"$(nproc)"`, sees that many without a change to
+  the project. A Slurm build that used every core of the login node is now slower.
 
 ## 0.2.2 (2026-11-09)
 
