@@ -301,8 +301,8 @@ def add_arguments(commands):
                         help="on AWS: reserve a whole instance of the largest type per command (timing experiments)")
     parser.add_argument("--label", default="", help="free text recorded in the manifest and receipt")
     parser.add_argument("--dry-run", action="store_true",
-                        help="check and plan; build, upload and submit nothing (on a machine it reads an image "
-                             "already there)")
+                        help="check and plan; build, upload and submit nothing (on a machine it reads the image "
+                             "and, on Slurm, the partition's billing weights)")
     parser.add_argument("--json", action="store_true",
                         help="on a machine: print one JSON object, the dry run's fields (with the batch script) "
                              "and, after a submission, its receipt")

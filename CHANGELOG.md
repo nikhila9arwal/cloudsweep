@@ -10,6 +10,10 @@
   each task's state, start, end, elapsed time, node, allocated GPUs and billing units (for a
   requeued task, each execution's), with the GPU-hours and billing unit-hours summed (`accounting` in `status --json` and in `fetch.json`).
   The final record is kept on the machine. A cluster without accounting still shows the queue.
+- A dry run of a Slurm submission reads the partition's `TRESBillingWeights` and `PriorityFlags`
+  with `scontrol` and shows each task's billing units (also in the receipt), with a warning when a
+  GPU request's CPUs or memory exceed its GPUs' share. Tested read-only on the ECE cluster (no
+  weights: allocated CPUs) and DeltaAI (`ghx4` 1000 units per GPU, `ghx4-interactive` 2000).
 - **Changed:** a dry run on a machine whose section names an image already there
   (`container = PATH.sif`) now reads that image, as a submission does, so its build and image
   identity match the submission's; a missing image is refused. Earlier it said the image is

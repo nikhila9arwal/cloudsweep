@@ -112,6 +112,20 @@ def when(match):
 if os.path.exists(name):
     sys.stdout.write(re.sub(r"\\{{t:(\\d+)\\}}", when, open(name).read()))
 """
+FAKE_SCONTROL = """#!{python}
+import os, sys
+here = os.environ["FAKE_SLURM"]
+if sys.argv[1:] == ["-o", "show", "partition"]:
+    sys.stdout.write(open(os.path.join(here, "partitions.txt")).read())
+elif sys.argv[1:] == ["show", "config"]:
+    sys.stdout.write("AccountingStorageTRES   = cpu,mem\\n")
+    if os.path.exists(os.path.join(here, "flags.txt")):
+        sys.stdout.write("PriorityFlags           = %s\\n" % open(os.path.join(here, "flags.txt")).read().strip())
+"""
+PARTITIONS = """PartitionName=cpu AllowGroups=ALL Default=YES QoS=N/A TRES=cpu=848,mem=7893156M,node=7,billing=848
+PartitionName=gpu AllowGroups=ALL Default=NO TRESBillingWeights=CPU=13.888888,Mem=9.01726G,GRES/gpu=1000
+PartitionName=gpu-short AllowGroups=ALL Default=NO TRESBillingWeights=CPU=27.777776,Mem=18.03452G,GRES/gpu=2000
+"""
 
 
 class MachineFixture(unittest.TestCase):
@@ -127,7 +141,7 @@ class MachineFixture(unittest.TestCase):
         self.sweep.write_text("".join('["{bin}", "{out}", "%d", "{input:trace.bin}"]\n' % i for i in range(3)))
         fakes = self.root / "bin"
         fakes.mkdir()
-        for name, text in (("ssh", FAKE_SSH), ("sbatch", FAKE_SBATCH),
+        for name, text in (("ssh", FAKE_SSH), ("sbatch", FAKE_SBATCH), ("scontrol", FAKE_SCONTROL),
                            ("squeue", FAKE_REPORTER % ("queue.txt", "squeue")),
                            ("sacct", FAKE_REPORTER % ("accounting.txt", "sacct")),
                            ("scancel", "#!/bin/sh\necho scancel \"$@\" >> \"$FAKE_LOG\"\n")):
@@ -135,6 +149,8 @@ class MachineFixture(unittest.TestCase):
             (fakes / name).chmod(0o755)
         self.slurm = self.root / "slurm"
         self.slurm.mkdir()
+        (self.slurm / "partitions.txt").write_text(PARTITIONS)
+        (self.slurm / "flags.txt").write_text("MAX_TRES")
         self.home = self.root / "home"
         self.home.mkdir()
         (self.home / "cs-setup.sh").write_text("export FROM_SETUP=yes\n")  # setup paths are relative to home
@@ -227,7 +243,10 @@ class MachineTests(MachineFixture):
         self.assertIn("#SBATCH --gpus-per-node=h100:2", out)
         self.assertIn('"--partition=gpu"', out)
         self.assertNotIn("--partition=cpu", out)
-        self.assertFalse(self.log.exists())  # a dry run contacts nothing
+        # A dry run only reads the cluster (its partitions' billing weights): nothing is sent or started.
+        self.assertNotIn("sbatch", self.log.read_text())
+        self.assertFalse((self.root / "cluster").exists())
+        self.assertIn("billing on gpu: 2000 unit(s) per task, the largest term (MAX_TRES)", out)
 
     def test_ssh_pool_runs_commands_in_slots(self):
         submission, out = self.submit("box")
@@ -416,8 +435,8 @@ def utc(*when):
 
 
 class SlurmTests(MachineFixture):
-    """What status and fetch read from Slurm: the queue and the accounting, with fake squeue and
-    sacct output."""
+    """What status, fetch and a dry run read from Slurm: the queue, the accounting and the
+    partitions' billing weights, with fake squeue, sacct and scontrol output."""
 
     def held(self, *extra):
         os.environ["FAKE_HOLD"] = "1"  # sbatch queues the job and runs nothing
@@ -536,6 +555,33 @@ class SlurmTests(MachineFixture):
         sacct.unlink()
         self.assertIn("Slurm accounting unavailable: sacct: ", self.cli("status", submission)[1])
 
+    def test_billing_is_unknown_when_the_cluster_does_not_say_its_priority_flags(self):
+        (self.slurm / "flags.txt").unlink()
+        code, out, err = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--gpus", "1",
+                                          "--commands", str(self.sweep), "--input", "trace.bin")
+        self.assertEqual(code, 0, err)
+        self.assertIn("gave no PriorityFlags", json.loads(out)["billing"][0]["error"])
+
+    def test_a_dry_run_shows_the_partition_s_billing_and_warns_above_a_gpu_s_share(self):
+        code, out, err = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--gpus", "1",
+                                          "--memory-mib", str(128 * 1024), "--commands", str(self.sweep),
+                                          "--input", "trace.bin")
+        self.assertEqual(code, 0, err)
+        plan = json.loads(out)
+        self.assertEqual(len(plan["billing"]), 1)
+        billing = plan["billing"][0]
+        self.assertEqual((billing["partition"], billing["default"], billing["units"], billing["per_gpu"],
+                          billing["as_gpus"]), ("gpu", False, 1154.21, 1000, 1.154))
+        self.assertEqual(billing["terms"], {"cpu": 13.89, "mem": 1154.21, "gres/gpu": 1000})
+        self.assertIn("warning: on gpu each task bills 1154.21 units, worth 1.154 GPU(s): its 128 GiB of memory exceed "
+                      "1 GPU(s)' share (110.9 GiB)", err)
+        code, out, err = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--commands",
+                                          str(self.sweep), "--input", "trace.bin")
+        billing = json.loads(out)["billing"][0]  # a CPU job, on the partition its section names
+        self.assertEqual((billing["partition"], billing["units"], billing["weights"]), ("cpu", 1, None))
+        self.assertIn("billing on cpu: 1 unit(s) per task (no TRESBillingWeights: Slurm bills the allocated CPUs)", err)
+        self.assertNotIn("sbatch", self.log.read_text())
+
     def test_submit_json_gives_the_dry_run_fields_and_the_receipt(self):
         code, out, _ = self.cli_streams("submit", "--on", "cluster", "--dry-run", "--json", "--commands",
                                         str(self.sweep), "--input", "trace.bin")
@@ -559,6 +605,61 @@ class SlurmTests(MachineFixture):
         code, out, err = self.cli_streams("submit", "--on", "aws", "--json", "--commands", str(self.sweep))
         self.assertEqual((code, out), (1, ""))
         self.assertIn("--json is for machines", err)
+
+
+class BillingTests(unittest.TestCase):
+    """The units of a request under a partition's TRESBillingWeights, as Slurm computes them."""
+    BATCH = "CPU=13.888888,Mem=9.01726G,GRES/gpu=1000"
+
+    def request(self, cpus=8, gib=96, gpus=1, gpu_type=None):
+        return {"cpus": cpus, "memory_mib": gib * 1024, "gpus": gpus, "gpu_type": gpu_type}
+
+    def test_the_largest_term_is_billed_with_max_tres(self):
+        found = machines.billing_units(self.BATCH, "MAX_TRES", self.request())
+        self.assertEqual((found["units"], found["terms"]), (1000, {"cpu": 111.11, "mem": 865.66, "gres/gpu": 1000}))
+        self.assertEqual(machines.gpu_share(dict(found, partition="p"), self.request()),
+                         {"per_gpu": 1000, "as_gpus": 1})
+        twice = machines.billing_units("CPU=27.777776,Mem=18.03452G,GRES/gpu=2000", "MAX_TRES", self.request())
+        self.assertEqual(twice["units"], 2000)  # DeltaAI's interactive partition: one GPU bills 2000
+
+    def test_memory_or_cpus_above_the_gpus_share_are_warned_about(self):
+        found = machines.billing_units(self.BATCH, "MAX_TRES", self.request(gib=128))
+        share = machines.gpu_share(dict(found, partition="ghx4"), self.request(gib=128))
+        self.assertEqual((found["units"], share["as_gpus"]), (1154.21, 1.154))
+        self.assertEqual(share["warning"], "on ghx4 each task bills 1154.21 units, worth 1.154 GPU(s): its 128 GiB "
+                                           "of memory exceed 1 GPU(s)' share (110.9 GiB)")
+        found = machines.billing_units(self.BATCH, "MAX_TRES", self.request(cpus=96))
+        self.assertIn("96 CPUs exceed 1 GPU(s)' share (72 CPUs)",
+                      machines.gpu_share(dict(found, partition="p"), self.request(cpus=96))["warning"])
+
+    def test_the_sum_is_billed_without_max_tres_and_cpus_without_weights(self):
+        found = machines.billing_units(self.BATCH, "", self.request())
+        self.assertEqual((found["units"], found["rule"]), (1976.77, "the sum"))
+        found = machines.billing_units(None, "", self.request())
+        self.assertEqual(found["units"], 8)
+        self.assertIn("Slurm bills the allocated CPUs", found["notes"][0])
+        typed = machines.billing_units("CPU=1,GRES/gpu:h100=500,License/x=3", "", self.request(gpu_type="H100"))
+        self.assertEqual(typed["terms"], {"cpu": 8, "gres/gpu:h100": 500})
+        self.assertEqual(typed["notes"], ["the weight License/x=3 is not counted"])
+
+    def test_gpus_that_weigh_nothing_bill_without_a_gpu_s_worth(self):
+        found = machines.billing_units("CPU=1,GRES/gpu=0", "MAX_TRES", self.request())
+        self.assertEqual((found["units"], machines.gpu_share(dict(found, partition="p"), self.request())), (8, {}))
+
+    def test_rules_cloudsweep_does_not_know_are_not_guessed(self):
+        self.assertIn("does not apply", machines.billing_units(self.BATCH, "MAX_TRES_GRES", self.request())["error"])
+        self.assertIn("cannot read", machines.billing_units("CPU=1K", "", self.request())["error"])
+
+    def test_the_request_includes_the_sections_sbatch_options(self):
+        job = {"vcpus": 1, "memory_mib": 3500, "gpus": 1, "gpu_type": "h100",
+               "sbatch": ["--account=a", "-p", "gpu-short", "--mem=128G", "-c4", "--exclusive"]}
+        partitions, request, uncounted = machines.requested(job)
+        self.assertEqual((partitions, request, uncounted),
+                         (["gpu-short"], {"cpus": 4, "memory_mib": 131072, "gpus": 1, "gpu_type": "h100"},
+                          ["--exclusive"]))
+        self.assertEqual(machines.requested(dict(job, sbatch=["--partition=a,b", "--mem", "0"]))[::2],
+                         (["a", "b"], ["--mem"]))
+        self.assertIsNone(machines.requested(dict(job, sbatch=[]))[0])
 
 
 FAKE_APPTAINER = """#!{python}

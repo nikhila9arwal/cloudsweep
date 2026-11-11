@@ -131,6 +131,28 @@ task Slurm requeued has an entry for each execution (`sacct --duplicates`), so t
 execution used is counted. A cluster without accounting
 still shows the queue, with the accounting reported as unavailable.
 
+## Billing on Slurm
+
+A dry run of a Slurm submission reads the partition's settings with `scontrol` (read only) and
+shows what each task bills there, also in `submit --json` and in the receipt (`billing`):
+
+```text
+$ cloudsweep submit --on deltaai --dry-run --gpus 1 --vcpus 8 --memory-mib 131072 --commands sweep.jsonl
+billing on ghx4: 1154.21 unit(s) per task, the largest term (MAX_TRES) of cpu 111.11, gres/gpu 1000, mem 1154.21 (TRESBillingWeights CPU=13.888888,Mem=9.01726G,GRES/gpu=1000); worth 1.154 GPU(s) at 1000 units per GPU
+warning: on ghx4 each task bills 1154.21 units, worth 1.154 GPU(s): its 128 GiB of memory exceed 1 GPU(s)' share (110.9 GiB)
+```
+
+The units follow Slurm's rule for the partition's `TRESBillingWeights`: each weight times the amount
+requested (memory per MiB, or per unit of the weight's suffix, as `G`), added up, or with
+`PriorityFlags=MAX_TRES` the largest of them. A partition without weights bills the allocated CPUs,
+which can be more than requested on a node that allocates whole cores. The request is the batch
+script's, with the section's `sbatch` options for the partition, `--cpus-per-task` and `--mem`
+applied; other options that change it (`--exclusive`, `--mem-per-gpu`, ...) are named as not counted.
+A GPU request is warned about when its CPUs or memory bill more than its GPUs. What an allocation
+charges per unit is the site's rule, which Slurm does not state; the GPU-hours `status` reports are
+counted from what Slurm allocated, not from the charge. For a rule cloudsweep does not apply (a
+variant of `MAX_TRES` in `PriorityFlags` other than `MAX_TRES` itself), it reports the units as unknown.
+
 ## Containers
 
 By default commands use the machine's own software. Add `container = apptainer` to a machine's
@@ -190,5 +212,6 @@ directory for this host's podman; a machine that builds the image uses its own t
   `submit` warns when it is off. Without `systemd`, the pool survives logout on most machines.
 - An ssh machine must be one host, not a round-robin alias, since its pool is a process there.
   Each submission runs its own pool.
-- There are no cost estimates or spending limits off AWS, and no `--isolated`. `workdir` keeps every
-  build and submission; remove old ones there by hand.
+- There are no dollar estimates or spending limits off AWS, and no `--isolated`; on Slurm, the
+  [billing units](#billing-on-slurm) are shown. `workdir` keeps every build and submission; remove
+  old ones there by hand.

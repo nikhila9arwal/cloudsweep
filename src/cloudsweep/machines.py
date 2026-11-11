@@ -326,6 +326,172 @@ def job_script(job, setup, code):
     return "\n".join(lines) + "\n"
 
 
+MEMORY_RE = re.compile(r"([0-9]+)([KMGT]?)", re.I)
+UNITS = "KMGTP"
+# sbatch options that change the request in ways the billing below does not count.
+UNCOUNTED = ("--exclusive", "--mem-per-cpu", "--mem-per-gpu", "--cpus-per-gpu", "--gres", "--gpus", "-G",
+             "--gpus-per-node", "--gpus-per-task", "--ntasks", "-n", "--nodes", "-N")
+
+
+def requested(job):
+    """What each array task asks Slurm for: the batch script's request with the sbatch options from
+    machines.ini, which win, applied. Returns the partitions (None: the default one), the request
+    and the options that change it in ways not counted."""
+    partitions, uncounted = None, []
+    request = {"cpus": job["vcpus"], "memory_mib": job["memory_mib"], "gpus": job["gpus"],
+               "gpu_type": job.get("gpu_type") if job["gpus"] else None}
+    options, index = list(job["sbatch"]), 0
+    while index < len(options):
+        option, value = options[index], None
+        for flag, short in (("--partition", "-p"), ("--cpus-per-task", "-c"), ("--mem", None)):
+            if option.startswith(flag + "="):
+                value = option[len(flag) + 1:]
+            elif option == flag or option == short:
+                value = options[index + 1] if index + 1 < len(options) else ""
+                index += 1
+            elif short and option.startswith(short) and not option.startswith("--"):
+                value = option[len(short):]
+            if value is not None:
+                break
+        if value is None:
+            if option.split("=")[0] in UNCOUNTED:
+                uncounted.append(option)
+        elif flag == "--partition":
+            partitions = [name for name in value.split(",") if name]
+        elif flag == "--cpus-per-task" and value.isdigit():
+            request["cpus"] = int(value)
+        elif flag == "--mem" and MEMORY_RE.fullmatch(value) and int(MEMORY_RE.fullmatch(value).group(1)):
+            number, unit = MEMORY_RE.fullmatch(value).groups()
+            request["memory_mib"] = int(number) * 1024 ** (UNITS.index((unit or "M").upper()) - 1)
+        else:
+            uncounted.append(option)
+        index += 1
+    return partitions, request, uncounted
+
+
+def settings_line(text):
+    """scontrol's one-line form (Key=Value ...) as a dict."""
+    return dict(item.partition("=")[::2] for item in text.split() if "=" in item)
+
+
+def billing_units(weights, flags, request):
+    """The billing units of one task by Slurm's rule for the partition's TRESBillingWeights: each
+    weight times the amount requested (memory weights per MiB, or per unit of their suffix), summed,
+    or with PriorityFlags MAX_TRES the largest of them. Without weights Slurm bills the CPUs."""
+    if not weights:
+        return {"units": request["cpus"], "terms": {"cpu": request["cpus"]},
+                "notes": ["the partition sets no TRESBillingWeights, so Slurm bills the allocated CPUs, which "
+                          "can exceed those requested (a node that allocates whole cores)"]}
+    amounts = {"cpu": request["cpus"], "mem": request["memory_mib"], "node": 1, "gres/gpu": request["gpus"]}
+    if request["gpu_type"]:
+        amounts["gres/gpu:" + request["gpu_type"].lower()] = request["gpus"]
+    terms, notes = {}, []
+    for item in weights.split(","):
+        name, _, text = item.partition("=")
+        name, found = name.strip().lower(), re.fullmatch(r"([0-9]*\.?[0-9]+)([KMGTP]?)", text.strip(), re.I)
+        if not found or (found.group(2) and name != "mem"):
+            return {"error": "cannot read the billing weight %s" % item}
+        weight = float(found.group(1)) * 1024 ** (1 - UNITS.index((found.group(2) or "M").upper()))
+        if name in amounts:
+            terms[name] = weight * amounts[name]
+        elif not name.startswith("gres/gpu:"):
+            notes.append("the weight %s is not counted" % item)
+    flag_set = {flag.strip() for flag in flags.split(",") if flag.strip()}
+    if {flag for flag in flag_set if flag.startswith("MAX_TRES")} - {"MAX_TRES"}:
+        return {"error": "PriorityFlags %s: a billing rule cloudsweep does not apply" % flags}
+    largest = "MAX_TRES" in flag_set
+    return {"units": round(max(terms.values()) if largest else sum(terms.values()), 2) if terms else 0,
+            "terms": {name: round(value, 2) for name, value in terms.items()}, "notes": notes,
+            "rule": "the largest term (MAX_TRES)" if largest else "the sum"}
+
+
+def gpu_share(billing, request):
+    """For a GPU request: the units per GPU, the request in GPUs' worth of billing, and a warning
+    when its CPUs or memory bill more than its GPUs, that is, exceed the GPUs' share of them."""
+    terms = billing["terms"]
+    gpu_terms = [value for name, value in terms.items() if name.startswith("gres/gpu")]
+    if not request["gpus"] or not gpu_terms or not billing["units"]:
+        return {}
+    per_gpu = (max(gpu_terms) if "MAX_TRES" in billing["rule"] else sum(gpu_terms)) / request["gpus"]
+    if per_gpu <= 0:  # GPUs weigh nothing here: there is no GPU's worth to state
+        return {}
+    found, over = {"per_gpu": round(per_gpu, 2), "as_gpus": round(billing["units"] / per_gpu, 3)}, []
+    gpus_units = per_gpu * request["gpus"]
+    if terms.get("cpu", 0) > gpus_units:
+        over.append("%d CPUs exceed %d GPU(s)' share (%d CPUs)" % (
+            request["cpus"], request["gpus"], gpus_units / terms["cpu"] * request["cpus"]))
+    if terms.get("mem", 0) > gpus_units:
+        over.append("%s GiB of memory exceed %d GPU(s)' share (%s GiB)" % (
+            amount(request["memory_mib"] / 1024), request["gpus"],
+            ("%.1f" % (gpus_units / terms["mem"] * request["memory_mib"] / 1024)).rstrip("0").rstrip(".")))
+    if over:
+        found["warning"] = "on %s each task bills %s units, worth %s GPU(s): its %s" % (
+            billing["partition"], amount(billing["units"]), amount(found["as_gpus"]), "; its ".join(over))
+    return found
+
+
+def slurm_billing(machine, job):
+    """What each task bills on its partition(s), read from the cluster (scontrol, read only):
+    the partition's TRESBillingWeights and PriorityFlags, the units of this request, and for a GPU
+    request whether its CPUs or memory make it bill more than its GPUs. Never refuses: a value the
+    cluster does not give is reported as such."""
+    partitions, request, uncounted = requested(job)
+    script = "\n".join(machine["setup"] + ["command -v scontrol > /dev/null || { echo CLOUDSWEEP-NO-SCONTROL; exit; }",
+                                           "scontrol -o show partition", "echo CLOUDSWEEP-CONFIG",
+                                           "scontrol show config | grep -i '^PriorityFlags'"])
+    try:
+        done = ssh(machine, script)
+    except Refusal as error:
+        return [{"partition": name, "error": str(error)} for name in partitions or [None]]
+    if "CLOUDSWEEP-NO-SCONTROL" in done.stdout.split():
+        return [{"partition": name, "error": "scontrol is not on PATH after the setup lines"}
+                for name in partitions or [None]]
+    shown, _, config = done.stdout.partition("CLOUDSWEEP-CONFIG")
+    found = {}
+    for line in shown.splitlines():
+        if line.startswith("PartitionName="):
+            fields = settings_line(line)
+            found[fields["PartitionName"]] = fields
+    if not config.strip().lower().startswith("priorityflags"):  # not read: its rule cannot be applied
+        return [{"partition": name, "error": "scontrol show config gave no PriorityFlags (exit %d)" % done.returncode}
+                for name in partitions or [None]]
+    flags = (config.strip().partition("=")[2]).strip()
+    default = partitions is None
+    if default:
+        partitions = [name for name, fields in found.items() if fields.get("Default") == "YES"][:1] or [None]
+    rows = []
+    for name in partitions:
+        if name not in found:
+            rows.append({"partition": name, "error": "scontrol shows no partition %s (exit %d)"
+                         % (name or "marked Default", done.returncode)})
+            continue
+        weights = found[name].get("TRESBillingWeights")
+        row = dict(billing_units(weights, flags, request), partition=name, default=default, weights=weights,
+                   priority_flags=flags, request=request)
+        if "error" not in row:
+            row.update(gpu_share(row, request))
+            if uncounted:
+                row["notes"] = row["notes"] + ["not counted: sbatch %s" % " ".join(uncounted)]
+        rows.append(row)
+    return rows
+
+
+def billing_text(row):
+    """One line for people: the units of a task on its partition, and how they were found."""
+    where = (row.get("partition") or "the default partition") + (" (the default)" if row.get("default") else "")
+    if row.get("error"):
+        return "billing on %s: unknown (%s)" % (where, row["error"])
+    if not row.get("weights"):
+        return "billing on %s: %s unit(s) per task (no TRESBillingWeights: Slurm bills the allocated CPUs)" % (
+            where, amount(row["units"]))
+    text = "billing on %s: %s unit(s) per task, %s of %s (TRESBillingWeights %s)" % (
+        where, amount(row["units"]), row["rule"],
+        ", ".join("%s %s" % (name, amount(value)) for name, value in sorted(row["terms"].items())), row["weights"])
+    if row.get("per_gpu"):
+        text += "; worth %s GPU(s) at %s units per GPU" % (amount(row["as_gpus"]), amount(row["per_gpu"]))
+    return text
+
+
 def at(machine, path):
     """A path on the machine as rsync names it."""
     return path if machine["host"] == LOCAL else "%s:%s" % (machine["host"], path)
@@ -442,6 +608,10 @@ def submit(args, prepare):
                        gpu_type=machine["gpu_type"])
             script = job_script(job, machine["setup"], code_hash(files_code))
             plan["sbatch"] = ["sbatch"] + job["sbatch"] + ["jobs/%s/job.sh" % submission]
+            plan["billing"] = slurm_billing(machine, job)
+            for row in plan["billing"]:
+                print(billing_text(row) + ("\nwarning: " + row["warning"] if row.get("warning") else ""),
+                      file=sys.stderr, flush=True)
         else:
             job.update(slots=machine["slots"], machine_gpus=machine["gpus"], systemd=machine["systemd"])
             plan["slots"] = ("one per %d GPU(s)" % gpus if gpus else machine["slots"] or
