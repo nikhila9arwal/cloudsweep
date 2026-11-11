@@ -17,7 +17,9 @@ sweeps when AWS will finish sooner. Use `cloudsweep --help` for syntax and
    `cloudsweep try` checks them in the AWS image). Repeat after changing the build or command line.
 2. For AWS, run `cloudsweep submit --on aws --dry-run ...`; inspect the instance, estimate and
    worst case before `cloudsweep submit --on aws ...`.
-3. Fetch with `cloudsweep fetch SUBMISSION DEST --wait`. Use results only when it reports
+3. On a machine, wait with `cloudsweep wait SUBMISSION` rather than polling `status`, and race
+   copies of one job with `cloudsweep race` rather than a script of your own. Fetch with
+   `cloudsweep fetch SUBMISSION DEST --wait`. Use results only when it reports
    `complete`; a finished job is insufficient.
 4. Record the submission ID, commit and machine, and on AWS the printed estimate. On Slurm,
    record the GPU-hours and billing that `status` or `fetch` reports. Report month-to-date spend

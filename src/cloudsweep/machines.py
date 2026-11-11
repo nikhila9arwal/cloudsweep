@@ -1037,12 +1037,18 @@ def status(args, groups):
     for machine, wanted in groups:
         wanted = wanted or receipts(repo, machine["name"])
         report = call_status(machine, *wanted) if wanted else {}
+        from . import race  # it builds on this module
+        for submission in wanted:  # a copy in a race: the race file's view of it
+            line, record = race.status_line(repo, submission)
+            if record and isinstance(report.get(submission), dict):
+                report[submission].update(race=record, race_line=line)
         reports.update(report)
         if args.json:
             continue
         print("%s (%s, %s)" % (machine["name"], machine["kind"], at(machine, machine["workdir"])))
         for submission in wanted:
-            print(describe(submission, report.get(submission, {})))
+            row = report.get(submission, {})
+            print(describe(submission, row) + ("\n    " + row["race_line"] if row.get("race_line") else ""))
         if not wanted:
             print("  no submissions recorded in this checkout")
     if args.json:

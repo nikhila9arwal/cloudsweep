@@ -54,6 +54,12 @@
 - `status` of an ssh pool reports its `started` and `finished` times. A pool whose supervisor died
   reports how many of its commands still run (`orphans`), and `cancel` stops them; before, it said
   "not running" while they ran on.
+- `cloudsweep wait SUBMISSION [--until running|done]` waits on a machine until a submission runs
+  or ends. `cloudsweep race A B ... --keep first-start|first-success` keeps one of several copies
+  of one job: the first to start, or the first to succeed, running one copy at a time. It records
+  every decision, in UTC, in `.cloudsweep/races/` and in the copies' receipts before acting on it,
+  cancels the other copies and records what each used, and resumes when run again. `status` shows a
+  copy's race.
 
 ## 0.2.2 (2026-11-09)
 

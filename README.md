@@ -12,6 +12,7 @@ cloudsweep submit --commands sweep.jsonl                      # this host
 cloudsweep submit --on deltaai --commands sweep.jsonl --gpus 1   # a Slurm cluster
 cloudsweep submit --on aws --commands sweep.jsonl             # AWS Batch
 cloudsweep fetch <submission> --wait                          # verified results, from any of them
+cloudsweep race <a> <b> --keep first-start                    # keep the first of two copies to start
 ```
 
 ## Install

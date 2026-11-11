@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 
-from . import __version__, admin, engine, fetch, image, machines, project, settings, status, submit
+from . import __version__, admin, engine, fetch, image, machines, project, race, settings, status, submit
 from .project import Refusal
 
 
@@ -146,6 +146,7 @@ def main(argv=None):
     submit.add_arguments(commands)
     status.add_arguments(commands)
     fetch.add_arguments(commands)
+    race.add_arguments(commands)
     args = parser.parse_args(sys.argv[1:] if argv is None else argv)
     try:
         return args.handler(args)

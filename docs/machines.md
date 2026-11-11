@@ -11,6 +11,8 @@ cloudsweep submit --on deltaai --commands sweep.jsonl --gpus 1
 cloudsweep status <submission>
 cloudsweep fetch <submission> --wait
 cloudsweep cancel <submission>
+cloudsweep wait <submission>                                   # until it runs or ends
+cloudsweep race <a> <b> --keep first-start                     # keep the first copy to start
 ```
 
 `status`, `cancel` and `fetch` find the machine in the submission's receipt; `--on MACHINE` names
@@ -170,6 +172,57 @@ start, end, `elapsed_s`, nodes, partition, `gpus`, `billing` and `exit_code`, an
 task Slurm requeued has an entry for each execution (`sacct --duplicates`), so the time an earlier
 execution used is counted. A cluster without accounting
 still shows the queue, with the accounting reported as unavailable.
+
+## Waiting and racing
+
+`cloudsweep wait SUBMISSION` polls a submission until it has started or ended; `--until done` waits
+until it has ended. `cloudsweep race` keeps one of several copies of one job, each an ordinary
+submission, for example the same job on a busy cluster and on two partitions of another:
+
+```bash
+set -eo pipefail
+A=$(cloudsweep submit --on ece-gpu --gpus 1 --json --commands job.jsonl | jq -r .submission)
+B=$(cloudsweep submit --on deltaai --gpus 1 --json --commands job.jsonl | jq -r .submission)
+C=$(cloudsweep submit --on deltaai --partition ghx4-interactive --hours 2 --gpus 1 --json \
+      --commands job.jsonl | jq -r .submission)
+K=$(cloudsweep race $A $B $C --keep first-start --json | jq -r .kept)
+cloudsweep wait $K --until done
+cloudsweep fetch $K
+```
+
+- `--keep first-start` keeps the first copy to start and cancels the others, queued or running.
+- `--keep first-success` lets one copy run at a time, the runner, and keeps the others queued as
+  backups. A copy that starts while the runner runs is cancelled; when the runner fails, the next
+  copy to start runs; when it succeeds (every command's exit code 0), it is kept and the others are
+  cancelled.
+- A copy's start is the scheduler's actual start, never Slurm's estimate; copies that start in the
+  same second go in the order given. A copy on a machine that does not answer is not waited for
+  when choosing, and nothing is judged against a runner that cannot be seen.
+- Copies must be of one job: the same commit, commands as written (they may differ through
+  [variables](#variables)), inputs and `--no-build`. They may differ in machine, partition,
+  resources and time limit.
+- Each cancelled or failed copy's elapsed time, GPU-hours and billing are recorded once it has
+  stopped (or `accounting unavailable` after 15 minutes); the kept copy's are in `status` and in
+  `fetch.json`.
+
+The race's record is `.cloudsweep/races/<id>.json`; each copy's receipt holds its part (`race`: its
+role and events, every time in UTC), and `status` shows a line for it. A race runs in the
+foreground for as long as it takes (run it under `nohup`, `tmux` or `systemd-run`); if it stops, run
+the same `race` command, or `race` with any of its copies, and it resumes. While no copy has
+started, giving every copy still in the race plus new ones adds them, and another `--keep` changes
+the policy. One process controls a race at a time.
+
+| Exit | `wait` | `race` |
+|---|---|---|
+| 0 | reached | done: a copy kept |
+| 1 | refused, interrupted | refused, interrupted (rerun to resume) |
+| 2 | usage | usage |
+| 3 | `--timeout` reached | `--timeout` reached (rerun to resume) |
+| 4 | | lost: no copy started (first-start) or succeeded (first-success) |
+
+Both poll every `--poll` seconds (60 by default), print progress on stderr, and with `--json`
+print one object on stdout at the end: `wait`'s `result`, `observation` and `outcome`; `race`'s
+`race`, `result` and `kept`. Neither runs on AWS.
 
 ## Billing on Slurm
 
