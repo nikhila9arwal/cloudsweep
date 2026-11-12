@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.3.0 (2026-11-12)
 
 - `status` on a Slurm machine shows why each pending task waits (Slurm's reason), Slurm's estimated
   start or `no start estimate`, and each running task's node and start; `--json` carries them as
